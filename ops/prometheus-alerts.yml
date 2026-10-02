@@ -1,0 +1,76 @@
+# Copyright (c) 2026 Geunhwa Jeong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Alert rules for perp-liquidator. The liquidator also posts its own alerts to a webhook; these
+# cover what it cannot say about itself: that it stopped, or that it is falling behind.
+
+groups:
+  - name: perp-liquidator
+    rules:
+      - alert: LiquidatorDown
+        expr: up{job="perp-liquidator"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "The liquidator is not being scraped: liquidations are not happening"
+
+      - alert: LiquidatorRoundsStalled
+        expr: rate(perp_liquidator_rounds_total[2m]) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "The liquidator has finished no round for two minutes"
+
+      - alert: LiquidatorRoundsFailing
+        expr: rate(perp_liquidator_round_errors_total[5m]) / rate(perp_liquidator_rounds_total[5m]) > 0.5
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Most of the liquidator's rounds fail (database or full node unreachable?)"
+
+      - alert: LiquidatorIndexerLag
+        expr: perp_liquidator_indexer_lag_ms > 30000
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "The indexer the liquidator reads is {{ $value }} ms behind"
+
+      - alert: LiquidatablePositionsPersist
+        expr: min_over_time(perp_liquidator_liquidatable_positions[3m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.market }}: positions below maintenance for three minutes; liquidations are failing"
+
+      - alert: LiquidatorUnderwaterAttempts
+        expr: increase(perp_liquidator_aborts_total{reason=~"liquidator_underfunded|liquidator_in_bad_debt|package_version|bad_debt_beyond_limits"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.market }}: liquidations refused for {{ $labels.reason }}"
+
+      - alert: LiquidatorStaleOracle
+        expr: increase(perp_liquidator_aborts_total{reason=~"stale_oracle|oracle_divergence"}[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.market }}: the market cannot price anything ({{ $labels.reason }})"
+
+      - alert: LiquidatorGasLow
+        expr: perp_liquidator_gas_balance_haneul < 5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The liquidator holds {{ $value }} HANEUL for gas"
+
+      - alert: LiquidatorInventoryStuck
+        expr: perp_liquidator_inventory_usd > 10000
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.market }}: the liquidator has held {{ $value }} USD of inventory for ten minutes"
+
+      - alert: LiquidatorDryRun
+        expr: perp_liquidator_dry_run == 1
+        for: 30m
+        labels: {severity: info}
+        annotations:
+          summary: "The liquidator is only simulating"
