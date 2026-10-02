@@ -1,0 +1,42 @@
+[package]
+name = "perp-liquidator"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bigdecimal.workspace = true
+clap.workspace = true
+diesel.workspace = true
+diesel-async.workspace = true
+haneul-crypto.workspace = true
+haneul-rpc.workspace = true
+haneul-sdk-types.workspace = true
+haneul-transaction-builder.workspace = true
+hex.workspace = true
+num-bigint.workspace = true
+perp-bot-common.workspace = true
+perp-engine.workspace = true
+perp-types.workspace = true
+prometheus.workspace = true
+prost-types.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+bcs.workspace = true
+
+[[bin]]
+name = "perp-liquidator"
+path = "src/main.rs"

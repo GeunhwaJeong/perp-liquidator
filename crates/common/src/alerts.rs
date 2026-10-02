@@ -6,7 +6,7 @@
 //! channel; the log and the counter still see every occurrence.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -14,8 +14,18 @@ use serde_json::json;
 use tracing::{error, info, warn};
 use url::Url;
 
-use crate::config::AlertFormat;
-use crate::metrics::Metrics;
+use clap::ValueEnum;
+use prometheus::IntCounterVec;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AlertFormat {
+    /// `{"text": ...}`, which Slack and most chat webhooks take.
+    Slack,
+    /// `{"content": ...}`.
+    Discord,
+    /// `{"level", "key", "message", "service"}`.
+    Json,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,7 +51,8 @@ pub struct Alerts {
     repeat: Duration,
     http: reqwest::Client,
     last: Mutex<HashMap<String, Instant>>,
-    metrics: Arc<Metrics>,
+    /// Alerts raised, by level (`level` label), counted whether posted or not.
+    counter: IntCounterVec,
     /// Prefixed to every message, to tell deployments apart in a shared channel.
     service: String,
 }
@@ -51,7 +62,7 @@ impl Alerts {
         webhook: Option<Url>,
         format: AlertFormat,
         repeat: Duration,
-        metrics: Arc<Metrics>,
+        counter: IntCounterVec,
         service: String,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -63,7 +74,7 @@ impl Alerts {
             repeat,
             http,
             last: Mutex::default(),
-            metrics,
+            counter,
             service,
         })
     }
@@ -71,10 +82,7 @@ impl Alerts {
     /// Raises an alert. `key` identifies the condition for deduplication.
     pub fn raise(&self, level: Level, key: &str, message: impl Into<String>) {
         let message = message.into();
-        self.metrics
-            .alerts
-            .with_label_values(&[level.label()])
-            .inc();
+        self.counter.with_label_values(&[level.label()]).inc();
         match level {
             Level::Info => info!(alert = key, "{message}"),
             Level::Warning => warn!(alert = key, "{message}"),
@@ -155,13 +163,15 @@ mod tests {
 
     #[tokio::test]
     async fn repeats_are_not_posted_again_within_the_interval() {
-        let metrics = Arc::new(Metrics::new().unwrap());
+        let counter =
+            IntCounterVec::new(prometheus::Opts::new("alerts_total", "Alerts"), &["level"])
+                .unwrap();
         // Nothing listens on port 9; posting fails quietly in the background.
         let alerts = Alerts::new(
             Some("http://127.0.0.1:9/".parse().unwrap()),
             AlertFormat::Json,
             Duration::from_secs(600),
-            metrics.clone(),
+            counter.clone(),
             "s".into(),
         )
         .unwrap();
@@ -170,6 +180,6 @@ mod tests {
         alerts.raise(Level::Warning, "other", "three");
         assert_eq!(alerts.last.lock().unwrap().len(), 2);
         // Every occurrence is still counted.
-        assert_eq!(metrics.alerts.with_label_values(&["warning"]).get(), 3);
+        assert_eq!(counter.with_label_values(&["warning"]).get(), 3);
     }
 }

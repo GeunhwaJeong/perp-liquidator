@@ -77,7 +77,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         args.alert_webhook_url.clone(),
         args.alert_format,
         Duration::from_secs(args.alert_repeat_secs),
-        metrics.clone(),
+        metrics.alerts.clone(),
         service,
     )?);
     let board = Arc::new(Board::new(

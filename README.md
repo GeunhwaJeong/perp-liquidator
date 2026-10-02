@@ -26,6 +26,19 @@ A position whose bad debt only auto-deleveraging can close is closed against the
 profitable and most leveraged positions on the other side when the liquidator holds the ADL
 capability (`--adl-cap`), and reported with the plan otherwise.
 
+## Layout
+
+A Cargo workspace for the engine's operational bots. Each runs as its own process with its own
+key; what they have in common lives in one crate so that a fix or a version move happens once.
+
+| Crate | What it is |
+|---|---|
+| `crates/common` (`perp-bot-common`) | The full node (reading objects, resolving and simulating transactions, executing and waiting for the checkpoint), keys, the deployment file, the indexer's database, the oracle service's signed prices and alerts. |
+| `crates/liquidator` (`perp-liquidator`) | The liquidation bot described here. |
+
+The indexer and SDK pins are workspace dependencies in the root `Cargo.toml`, shared by every
+crate.
+
 ## Running
 
 ```bash
