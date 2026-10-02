@@ -74,3 +74,42 @@ groups:
         labels: {severity: info}
         annotations:
           summary: "The liquidator is only simulating"
+
+  # perp-cranker: keeps funding and TWAPs of quiet markets on schedule. It posts its own alerts
+  # too (funding being lost, a market failing, low gas); these catch it stopping or going quiet.
+  - name: perp-cranker
+    rules:
+      - alert: CrankerDown
+        expr: up{job="perp-cranker"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "The cranker is not being scraped: quiet markets get no funding updates"
+
+      - alert: CrankerRoundsStalled
+        expr: rate(perp_cranker_rounds_total[2m]) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "The cranker has finished no round for two minutes"
+
+      - alert: FundingIntervalsMissed
+        expr: perp_cranker_missed_funding_intervals >= 2
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.market }} has missed {{ $value }} funding intervals; the engine catches up three, then funding is lost"
+
+      - alert: CranksFailing
+        expr: increase(perp_cranker_cranks_total{result=~"refused|rejected|unknown|failed"}[10m]) > 5
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Cranks of {{ $labels.market }} keep failing ({{ $labels.result }}); see /status"
+
+      - alert: CrankerGasLow
+        expr: perp_cranker_gas_balance < 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The cranker holds {{ $value }} HANEUL"

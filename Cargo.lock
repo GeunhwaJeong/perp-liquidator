@@ -1555,6 +1555,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "perp-cranker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bcs",
+ "clap",
+ "haneul-crypto",
+ "haneul-sdk-types",
+ "haneul-transaction-builder",
+ "perp-bot-common",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "perp-engine"
 version = "0.1.0"
 source = "git+https://github.com/GeunhwaJeong/perp-indexer.git?rev=d37bc387e54ad689314bcabf0b583146473d8c93#d37bc387e54ad689314bcabf0b583146473d8c93"

@@ -35,6 +35,7 @@ key; what they have in common lives in one crate so that a fix or a version move
 |---|---|
 | `crates/common` (`perp-bot-common`) | The full node (reading objects, resolving and simulating transactions, executing and waiting for the checkpoint), keys, the deployment file, the indexer's database, the oracle service's signed prices and alerts. |
 | `crates/liquidator` (`perp-liquidator`) | The liquidation bot described here. |
+| `crates/cranker` (`perp-cranker`) | The funding cranker, below. |
 
 The indexer and SDK pins are workspace dependencies in the root `Cargo.toml`, shared by every
 crate.
@@ -141,3 +142,48 @@ given with `--engine-head` (read only).
 The margin formulas come from the indexer repository's `perp-engine` crate and the event
 layouts from its `perp-types` crate, pinned to one commit of it, so that both judge positions
 the same way. Move the pin when the indexer moves.
+
+## Funding cranker
+
+Every session updates a market's funding and TWAPs when they are due, so a market that trades
+needs no crank. A quiet one does: its premium TWAP is sampled only when something touches the
+market, so funding drifts from the book while nobody trades, and the engine catches up at most
+three missed funding intervals in one update. Funding a market goes longer than that without is
+lost.
+
+`perp-cranker` reads each market's clearing house from the full node every
+`--poll-interval-ms` and calls `clearing_house::update_funding`, which samples the due TWAPs and
+settles the due funding as a session start does, when:
+
+- funding is due on the market's own schedule (the next multiple of its funding frequency), or
+- a TWAP has gone `--twap-min-interval-ms` (60 s by default) without a sample, and never more
+  often than the market allows.
+
+When `--oracle-updates-url` is set the market's latest signed base price goes in front of the
+crank, which then goes through while the relayer is behind; without it a stale price makes the
+crank abort, which is reported. Paused and closed markets are left alone. Every crank is built
+and simulated by the full node first and signed only then. A market whose cranks keep failing
+the same way (`--skip-after` in a row) is left alone for `--skip-secs` instead of being paid for
+every round. A market that has missed two funding intervals raises a warning, three a critical
+alert and an unhealthy `/health`. When the deployment file changes the cranker exits with code 3,
+for its supervisor to start it again on the new markets.
+
+```bash
+target/release/perp-cranker \
+    --deployment perp.mainnet.json \
+    --rpc-url https://fullnode.example:443 \
+    --chain-id <chain id> \
+    --key-file /etc/perp-cranker/key \
+    --oracle-updates-url https://oracle.example/v1/updates
+```
+
+The key needs gas and no capability; give the cranker a key of its own. `/health`, `/status` and
+`/metrics` are served on `--listen-address` (`127.0.0.1:9189`); `ops/prometheus-alerts.yml` has
+rules for both bots.
+
+`scripts/localnet/cranker_check.py` runs it on the same held stack as `check.py` (a fresh one:
+both switch the market to a signed source) and checks, in eight phases: startup checks, TWAP
+samples and funding at each minute boundary on a market nobody trades, a dry run, a paused
+market, the critical alert after more than three missed intervals and the catch-up, stale prices
+with nothing relaying (refused and backed off), the signed base price relayed in the crank, and
+the exit on a changed deployment file.
