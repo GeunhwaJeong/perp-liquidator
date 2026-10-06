@@ -10,9 +10,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # blst otherwise compiles for the build host's CPU (ADX on GitHub's runners) and dies
-  # with SIGILL on older server CPUs; portable code dispatches at run time.
-  BLST_PORTABLE: "1"
+  # Build for a fixed CPU level, not the runner's. Without a target-cpu blst (linked
+  # through fastcrypto) compiles for the CPU of the machine that builds it, and GitHub's
+  # runners have ADX while the VPS (a Haswell-era vCPU) does not: the first binary died with
+  # SIGILL. x86-64-v2 has no ADX, and blst follows the target features when one is given.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
 jobs:
   build:
