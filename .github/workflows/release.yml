@@ -10,6 +10,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # blst otherwise compiles for the build host's CPU (ADX on GitHub's runners) and dies
+  # with SIGILL on older server CPUs; portable code dispatches at run time.
+  BLST_PORTABLE: "1"
 
 jobs:
   build:
