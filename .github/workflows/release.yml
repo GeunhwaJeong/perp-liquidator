@@ -1,0 +1,38 @@
+# Builds the liquidator and cranker binaries for the servers (x86_64 Linux, glibc of
+# ubuntu-24.04) on every push to main and on demand, and keeps them as a workflow artifact
+# named after the commit. Download with `gh run download <run id> -n perp-bots-linux-x86_64`.
+name: Release binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev
+      - run: cargo build --release --locked -p perp-liquidator -p perp-cranker
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/perp-liquidator target/release/perp-cranker dist/
+          strip dist/perp-liquidator dist/perp-cranker
+          echo "${GITHUB_SHA}" > dist/COMMIT
+          (cd dist && sha256sum perp-liquidator perp-cranker > SHA256SUMS)
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perp-bots-linux-x86_64
+          path: dist/
+          retention-days: 90
+          if-no-files-found: error
