@@ -36,6 +36,7 @@ key; what they have in common lives in one crate so that a fix or a version move
 | `crates/common` (`perp-bot-common`) | The full node (reading objects, resolving and simulating transactions, executing and waiting for the checkpoint), keys, the deployment file, the indexer's database, the oracle service's signed prices and alerts. |
 | `crates/liquidator` (`perp-liquidator`) | The liquidation bot described here. |
 | `crates/cranker` (`perp-cranker`) | The funding cranker, below. |
+| `crates/maker` (`perp-maker`) | The market maker and the shadow run's flow simulator, below; `docs/perp-maker-design.md` is its design. |
 
 The indexer and SDK pins are workspace dependencies in the root `Cargo.toml`, shared by every
 crate.
@@ -187,3 +188,42 @@ samples and funding at each minute boundary on a market nobody trades, a dry run
 market, the critical alert after more than three missed intervals and the catch-up, stale prices
 with nothing relaying (refused and backed off), the signed base price relayed in the crank, and
 the exit on a changed deployment file.
+
+## Market maker
+
+`perp-maker` quotes one market from its own engine account: a ladder of post-only levels on
+both sides of the price service's signed price, skewed by its inventory, with a spread that
+widens with the price's recent motion and confidence interval, every level expiring a minute
+after it is posted. A round (cancel what rests, post the new ladder, close the session through
+the fee extension) is one transaction, sent when the reference moved, a fill landed, the ladder
+changed shape or the expiry needs renewing. Past the inventory limit only the reducing side
+rests; past the hard limit the excess is sold through the book. A stale or uncertain price, a
+paused market or repeated failures pull every quote; so does stopping.
+
+```bash
+target/release/perp-maker \
+    --deployment perp.mainnet.json \
+    --rpc-url https://fullnode.example:443 \
+    --chain-id <chain id> \
+    --key-file /etc/perp-maker/key \
+    --account <Account object> --account-cap <AuthorityCap object over it> \
+    --market BTC-USD \
+    --oracle-updates-url https://oracle.example/v1/updates \
+    --database-url postgres://reader@db/perp_indexer
+```
+
+`--database-url` (or `--indexer-url https://api.example`) lets the first round cancel orders
+that rested before the maker started; without either, those rest until they expire. `--leverage`
+sets the account's margin ratio on the market once (a new position has none, and a ladder then
+needs its full value in margin). `--check-only` and `--dry-run` as for the other bots;
+`/health`, `/status` and `/metrics` on `--listen-address` (`127.0.0.1:9190`), metrics prefixed
+`perp_maker_`. The quoting parameters and their defaults are in `--help` and the design.
+
+`--flow`, with `--flow-key-file`, `--flow-account` and `--flow-account-cap`, adds the shadow
+run's flow simulator: a taker on its own account that sends a small immediate-or-cancel order
+at random intervals (mean `--flow-mean-secs`) against the maker, so that the market has fills,
+candles and funding. It is refused on any collateral whose module is not `tusd`.
+
+Verified on mainnet: a dry run against the live deployment simulates every round; a live run
+from the laptop posted ten levels around $85,845 in three rounds, the public order book showed
+them, and stopping pulled them all.

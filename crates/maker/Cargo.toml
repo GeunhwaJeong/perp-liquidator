@@ -1,5 +1,5 @@
 [package]
-name = "perp-bot-common"
+name = "perp-maker"
 version.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -7,26 +7,28 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bcs.workspace = true
+axum.workspace = true
 bigdecimal.workspace = true
 clap.workspace = true
-diesel.workspace = true
-diesel-async.workspace = true
 haneul-crypto.workspace = true
-haneul-rpc.workspace = true
 haneul-sdk-types.workspace = true
 haneul-transaction-builder.workspace = true
-hex.workspace = true
 num-bigint.workspace = true
+perp-bot-common.workspace = true
 perp-engine.workspace = true
 prometheus.workspace = true
-prost-types.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
-tonic.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+bcs.workspace = true
+
+[[bin]]
+name = "perp-maker"
+path = "src/main.rs"

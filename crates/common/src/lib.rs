@@ -9,4 +9,5 @@ pub mod chain;
 pub mod deployment;
 pub mod keys;
 pub mod oracle;
+pub mod position;
 pub mod store;

@@ -18,13 +18,23 @@ struct DeploymentFile {
     packages: PackagesFile,
     registry: Option<String>,
     collateral: CollateralFile,
+    /// The fee-tier extension's objects, when the deployment runs it.
+    fees: Option<FeesFile>,
     markets: BTreeMap<String, MarketFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeesFile {
+    schedule: String,
+    tier_registry: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PackagesFile {
     perpetuals: String,
+    perpetuals_fees: Option<String>,
     /// Where the engine's types were first published. The same as `perpetuals` until the
     /// package is upgraded; after that, calls go to the new version while objects and events
     /// keep the original's types.
@@ -51,10 +61,20 @@ pub struct Deployment {
     pub perpetuals: Address,
     pub perpetuals_original: Address,
     pub registry: Option<Address>,
+    /// The fee-tier extension, through which sessions record volume and earn maker rebates.
+    pub fees: Option<FeeObjects>,
     pub collateral_type: TypeTag,
     pub collateral_decimals: u32,
     pub collateral_feed: Address,
     pub markets: Vec<MarketConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeObjects {
+    /// The `perpetuals_fees` package.
+    pub package: Address,
+    pub schedule: Address,
+    pub tier_registry: Address,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,6 +126,15 @@ impl Deployment {
             });
         }
         ensure!(!markets.is_empty(), "the deployment lists no markets");
+        let fees = match (&file.fees, &file.packages.perpetuals_fees) {
+            (Some(fees), Some(package)) => Some(FeeObjects {
+                package: address("packages.perpetualsFees", package)?,
+                schedule: address("fees.schedule", &fees.schedule)?,
+                tier_registry: address("fees.tierRegistry", &fees.tier_registry)?,
+            }),
+            (Some(_), None) => bail!("fees are configured but packages.perpetualsFees is missing"),
+            _ => None,
+        };
         Ok(Self {
             perpetuals,
             perpetuals_original,
@@ -114,6 +143,7 @@ impl Deployment {
                 .as_deref()
                 .map(|r| address("registry", r))
                 .transpose()?,
+            fees,
             collateral_type,
             collateral_decimals: file.collateral.decimals,
             collateral_feed: address(
@@ -153,8 +183,9 @@ mod tests {
 
     const FILE: &str = r#"{
         "network": "localnet",
-        "packages": {"perpetuals": "0xc8"},
+        "packages": {"perpetuals": "0xc8", "perpetualsFees": "0xfe"},
         "registry": "0x5",
+        "fees": {"schedule": "0x5c", "tierRegistry": "0x7e"},
         "collateral": {"coinType": "0x7f::tusd::TUSD", "decimals": 6, "priceFeedStorage": "0x1d"},
         "markets": {
             "BTC-USD": {"marketId": "BTC-USD", "clearingHouse": "0xc0b6", "basePriceFeedStorage": "0xfa"},
@@ -168,6 +199,10 @@ mod tests {
         assert_eq!(d.perpetuals, Address::from_static("0xc8"));
         assert_eq!(d.perpetuals_original, d.perpetuals);
         assert_eq!(d.registry, Some(Address::from_static("0x5")));
+        let fees = d.fees.as_ref().unwrap();
+        assert_eq!(fees.package, Address::from_static("0xfe"));
+        assert_eq!(fees.schedule, Address::from_static("0x5c"));
+        assert_eq!(fees.tier_registry, Address::from_static("0x7e"));
         assert_eq!(d.collateral_decimals, 6);
         assert_eq!(d.markets.len(), 2);
         let btc = &d.select(&["BTC-USD".into()]).unwrap()[0];

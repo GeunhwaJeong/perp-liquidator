@@ -1542,6 +1542,7 @@ dependencies = [
  "haneul-transaction-builder",
  "hex",
  "num-bigint",
+ "perp-engine",
  "prometheus",
  "prost-types",
  "reqwest",
@@ -1614,6 +1615,32 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "perp-maker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bcs",
+ "bigdecimal",
+ "clap",
+ "haneul-crypto",
+ "haneul-sdk-types",
+ "haneul-transaction-builder",
+ "num-bigint",
+ "perp-bot-common",
+ "perp-engine",
+ "prometheus",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",

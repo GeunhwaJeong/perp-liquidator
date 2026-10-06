@@ -1,4 +1,4 @@
-# Builds the liquidator and cranker binaries for the servers (x86_64 Linux, glibc of
+# Builds the liquidator, cranker and maker binaries for the servers (x86_64 Linux, glibc of
 # ubuntu-24.04) on every push to main and on demand, and keeps them as a workflow artifact
 # named after the commit. Download with `gh run download <run id> -n perp-bots-linux-x86_64`.
 name: Release binaries
@@ -26,14 +26,14 @@ jobs:
         with:
           key: release
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev
-      - run: cargo build --release --locked -p perp-liquidator -p perp-cranker
+      - run: cargo build --release --locked -p perp-liquidator -p perp-cranker -p perp-maker
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/perp-liquidator target/release/perp-cranker dist/
-          strip dist/perp-liquidator dist/perp-cranker
+          cp target/release/perp-liquidator target/release/perp-cranker target/release/perp-maker dist/
+          strip dist/perp-liquidator dist/perp-cranker dist/perp-maker
           echo "${GITHUB_SHA}" > dist/COMMIT
-          (cd dist && sha256sum perp-liquidator perp-cranker > SHA256SUMS)
+          (cd dist && sha256sum perp-liquidator perp-cranker perp-maker > SHA256SUMS)
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:
