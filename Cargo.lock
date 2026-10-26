@@ -1587,6 +1587,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "perp-keeper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "diesel",
+ "diesel-async",
+ "haneul-sdk-types",
+ "hex",
+ "num-bigint",
+ "perp-bot-common",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "perp-liquidator"
 version = "0.1.0"
 dependencies = [

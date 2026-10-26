@@ -33,10 +33,11 @@ key; what they have in common lives in one crate so that a fix or a version move
 
 | Crate | What it is |
 |---|---|
-| `crates/common` (`perp-bot-common`) | The full node (reading objects, resolving and simulating transactions, executing and waiting for the checkpoint), keys, the deployment file, the indexer's database, the oracle service's signed prices and alerts. |
+| `crates/common` (`perp-bot-common`) | The full node (reading objects, resolving and simulating transactions, executing and waiting for the checkpoint), keys, the deployment file, the indexer's database, the oracle service's signed prices, alerts and the order tickets' commitments. |
 | `crates/liquidator` (`perp-liquidator`) | The liquidation bot described here. |
 | `crates/cranker` (`perp-cranker`) | The funding cranker, below. |
 | `crates/maker` (`perp-maker`) | The market maker and the shadow run's flow simulator, below; `docs/perp-maker-design.md` is its design. |
+| `crates/keeper` (`perp-keeper`) | Takes in and keeps the details of stop and TWAP order tickets, below. |
 
 The indexer and SDK pins are workspace dependencies in the root `Cargo.toml`, shared by every
 crate.
@@ -227,3 +228,31 @@ candles and funding. It is refused on any collateral whose module is not `tusd`.
 Verified on mainnet: a dry run against the live deployment simulates every round; a live run
 from the laptop posted ten levels around $85,845 in three rounds, the public order book showed
 them, and stopping pulled them all.
+
+## Keeper
+
+A stop or TWAP order ticket holds only a blake2b-256 commitment to its details, and only an
+executor that knows the details can execute it. `perp-keeper` is where the front end hands them
+in, right before it asks for the ticket's transaction to be signed: `POST /v1/details` with
+`{"kind": "stopLossTakeProfit" | "standaloneStop" | "twap", "details": {…}}`, the fields of
+perp-web's `tickets.ts` in camel case, integers as decimal strings and the salt as hex. The
+keeper hashes the details the way `perpetuals_orders` checks them (`perp_bot_common::tickets`),
+stores them under the commitment and answers with it; the front end signs only when the answer
+matches its own commitment.
+
+Handing in details needs no signature: anything but a ticket's true details is stored under a
+commitment no ticket holds. Every `--match-interval-secs` the keeper looks the waiting
+commitments up in the indexer's `order_tickets`, marks the ones a ticket holds and drops the
+others after `--unmatched-ttl-secs` (a day); new details are refused while `--max-unmatched`
+wait. The details live in a database of the keeper's own (`--details-database-url`; the table is
+created at startup), apart from the indexer's, which can be dropped and rebuilt from the chain:
+nowhere else has them.
+
+```bash
+target/release/perp-keeper \
+    --details-database-url postgres://keeper@db/sigma_keeper \
+    --database-url postgres://reader@db/perp_indexer
+```
+
+`POST /v1/details` and `/health` are served on `--listen-address` (`127.0.0.1:9191`). The keeper
+sends no CORS headers: serve it under the site's own origin. It does not execute tickets yet.
