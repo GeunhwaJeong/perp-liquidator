@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The keeper's two databases. Its own holds the details, keyed by the commitment they hash to;
-//! the indexer's is only read, to tell which commitments a ticket on chain holds.
+//! the indexer's is only read, to tell which commitments a ticket on chain holds and which
+//! tickets are open.
+
+use std::collections::HashMap;
 
 use anyhow::Context;
+use bigdecimal::BigDecimal;
 use diesel::QueryableByName;
 use diesel::sql_query;
-use diesel::sql_types::{Array, BigInt, Binary, Nullable, Text};
+use diesel::sql_types::{Array, BigInt, Binary, Nullable, Numeric, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -60,6 +64,39 @@ struct CommitmentRow {
 struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
+}
+
+#[derive(QueryableByName)]
+struct DetailsRow {
+    #[diesel(sql_type = Binary)]
+    commitment: Vec<u8>,
+    #[diesel(sql_type = Text)]
+    details: String,
+}
+
+/// An open stop ticket the keeper may execute.
+#[derive(Clone, Debug, QueryableByName)]
+pub struct OpenTicket {
+    #[diesel(sql_type = Text)]
+    pub ticket_id: String,
+    #[diesel(sql_type = BigInt)]
+    pub account_id: i64,
+    /// The account's shared object, which holds the ticket.
+    #[diesel(sql_type = Text)]
+    pub account: String,
+    /// 0: stop loss / take profit, 1: standalone stop.
+    #[diesel(sql_type = BigInt)]
+    pub stop_order_type: i64,
+    #[diesel(sql_type = Binary)]
+    pub commitment: Vec<u8>,
+}
+
+#[derive(QueryableByName)]
+struct LimitRow {
+    #[diesel(sql_type = Text)]
+    market: String,
+    #[diesel(sql_type = Nullable<Numeric>)]
+    max_index_twap_divergence: Option<BigDecimal>,
 }
 
 async fn pool(url: &Url, pool_size: u32, name: &str) -> anyhow::Result<Pool<AsyncPgConnection>> {
@@ -159,6 +196,26 @@ impl Store {
         Ok(rows.pop())
     }
 
+    /// The details stored under these commitments, as handed in, by commitment.
+    pub async fn details_of(
+        &self,
+        commitments: &[Vec<u8>],
+    ) -> anyhow::Result<HashMap<Vec<u8>, String>> {
+        if commitments.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut conn = self.pool.get().await.context("No database connection")?;
+        let rows =
+            sql_query("SELECT commitment, details FROM ticket_details WHERE commitment = ANY($1)")
+                .bind::<Array<Binary>, _>(commitments)
+                .get_results::<DetailsRow>(&mut conn)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.commitment, row.details))
+            .collect())
+    }
+
     /// The commitments still waiting for a ticket.
     pub async fn unmatched(&self) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut conn = self.pool.get().await.context("No database connection")?;
@@ -221,5 +278,45 @@ impl Indexer {
         .get_results::<CommitmentRow>(&mut conn)
         .await?;
         Ok(rows.into_iter().map(|row| row.commitment).collect())
+    }
+
+    /// The open stop tickets that name `executor` (written as the indexer writes addresses)
+    /// and no execution domain, oldest first.
+    pub async fn open_stop_tickets(&self, executor: &str) -> anyhow::Result<Vec<OpenTicket>> {
+        let mut conn = self.pool.get().await.context("No database connection")?;
+        Ok(sql_query(
+            "SELECT t.ticket_id, t.account_id, a.object_id AS account, \
+                    COALESCE(t.stop_order_type, -1)::BIGINT AS stop_order_type, \
+                    t.encrypted_details AS commitment \
+             FROM order_tickets t JOIN accounts a ON a.account_id = t.account_id \
+             WHERE t.kind = 'stop' AND t.status = 'open' AND t.execution_domain IS NULL \
+               AND t.executors @> jsonb_build_array($1::TEXT) \
+             ORDER BY t.created_checkpoint, t.ticket_id",
+        )
+        .bind::<Text, _>(executor)
+        .get_results(&mut conn)
+        .await?)
+    }
+
+    /// Each market's limit on how far its index price may stray from the index TWAP, as a
+    /// fraction of the TWAP.
+    pub async fn divergence_limits(
+        &self,
+        markets: &[String],
+    ) -> anyhow::Result<HashMap<String, BigDecimal>> {
+        let mut conn = self.pool.get().await.context("No database connection")?;
+        let rows = sql_query(
+            "SELECT market, \
+                    (params->'limits_params'->>'max_index_twap_divergence')::NUMERIC / 1e18 \
+                        AS max_index_twap_divergence \
+             FROM markets WHERE market = ANY($1)",
+        )
+        .bind::<Array<Text>, _>(markets)
+        .get_results::<LimitRow>(&mut conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| Some((row.market, row.max_index_twap_divergence?)))
+            .collect())
     }
 }

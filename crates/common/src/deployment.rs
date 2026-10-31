@@ -35,6 +35,7 @@ struct FeesFile {
 struct PackagesFile {
     perpetuals: String,
     perpetuals_fees: Option<String>,
+    perpetuals_orders: Option<String>,
     /// Where the engine's types were first published. The same as `perpetuals` until the
     /// package is upgraded; after that, calls go to the new version while objects and events
     /// keep the original's types.
@@ -63,6 +64,8 @@ pub struct Deployment {
     pub registry: Option<Address>,
     /// The fee-tier extension, through which sessions record volume and earn maker rebates.
     pub fees: Option<FeeObjects>,
+    /// The `perpetuals_orders` package, whose stop and TWAP order tickets the keeper executes.
+    pub perpetuals_orders: Option<Address>,
     pub collateral_type: TypeTag,
     pub collateral_decimals: u32,
     pub collateral_feed: Address,
@@ -144,6 +147,12 @@ impl Deployment {
                 .map(|r| address("registry", r))
                 .transpose()?,
             fees,
+            perpetuals_orders: file
+                .packages
+                .perpetuals_orders
+                .as_deref()
+                .map(|p| address("packages.perpetualsOrders", p))
+                .transpose()?,
             collateral_type,
             collateral_decimals: file.collateral.decimals,
             collateral_feed: address(
@@ -183,7 +192,7 @@ mod tests {
 
     const FILE: &str = r#"{
         "network": "localnet",
-        "packages": {"perpetuals": "0xc8", "perpetualsFees": "0xfe"},
+        "packages": {"perpetuals": "0xc8", "perpetualsFees": "0xfe", "perpetualsOrders": "0x0d"},
         "registry": "0x5",
         "fees": {"schedule": "0x5c", "tierRegistry": "0x7e"},
         "collateral": {"coinType": "0x7f::tusd::TUSD", "decimals": 6, "priceFeedStorage": "0x1d"},
@@ -203,6 +212,7 @@ mod tests {
         assert_eq!(fees.package, Address::from_static("0xfe"));
         assert_eq!(fees.schedule, Address::from_static("0x5c"));
         assert_eq!(fees.tier_registry, Address::from_static("0x7e"));
+        assert_eq!(d.perpetuals_orders, Some(Address::from_static("0x0d")));
         assert_eq!(d.collateral_decimals, 6);
         assert_eq!(d.markets.len(), 2);
         let btc = &d.select(&["BTC-USD".into()]).unwrap()[0];

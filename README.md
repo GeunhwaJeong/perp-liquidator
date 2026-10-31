@@ -37,7 +37,7 @@ key; what they have in common lives in one crate so that a fix or a version move
 | `crates/liquidator` (`perp-liquidator`) | The liquidation bot described here. |
 | `crates/cranker` (`perp-cranker`) | The funding cranker, below. |
 | `crates/maker` (`perp-maker`) | The market maker and the shadow run's flow simulator, below; `docs/perp-maker-design.md` is its design. |
-| `crates/keeper` (`perp-keeper`) | Takes in and keeps the details of stop and TWAP order tickets, below. |
+| `crates/keeper` (`perp-keeper`) | Takes in and keeps the details of stop and TWAP order tickets and executes the stop tickets, below. |
 
 The indexer and SDK pins are workspace dependencies in the root `Cargo.toml`, shared by every
 crate.
@@ -254,5 +254,54 @@ target/release/perp-keeper \
     --database-url postgres://reader@db/perp_indexer
 ```
 
-`POST /v1/details` and `/health` are served on `--listen-address` (`127.0.0.1:9191`). The keeper
-sends no CORS headers: serve it under the site's own origin. It does not execute tickets yet.
+`POST /v1/details`, `/health`, `/status` and `/metrics` are served on `--listen-address`
+(`127.0.0.1:9191`). The keeper sends no CORS headers: serve it under the site's own origin.
+
+### Executing the stop tickets
+
+Given a deployment file, a full node and a key (`--deployment`, `--rpc-url` and `--key-file`,
+together), the keeper also executes the stop tickets that name its address as their executor.
+Every `--poll-interval-ms` it reads the open stop tickets from the indexer, their details from its
+own database, and their markets and positions; judges each one the way
+`perpetuals_orders::stop_orders` does (the expiry, the trigger price on the index, the book or the
+mark price, the position a stop loss / take profit closes); and executes the ones whose trigger
+price has crossed, stop losses first and larger orders before smaller ones, one transaction each:
+the oracle service's signed prices, `place_stop_order_sltp` or `place_stop_order_standalone`, the
+ticket's gas merged into the keeper's gas coin and the clearing house shared again.
+
+The full node simulates every execution before it is signed, so a ticket the engine would refuse
+costs nothing. A failing ticket is tried again after `--retry-secs`, doubling up to
+`--max-retry-secs`, and alerted on after `--alert-after` failures in a row; the wait is forgotten
+once its trigger price no longer crosses. The engine fills a market order at any price, so an
+execution whose simulated fill strays from the index price by more than `--max-slippage-bps`
+(10%) is held back and alerted on. Tickets the engine would never take are left alone and counted
+on `/status` and `/metrics`: a stop loss / take profit without a position on its side, an expired
+ticket, a ticket whose details the keeper never got. TWAP tickets are not executed yet.
+
+```bash
+target/release/perp-keeper \
+    --details-database-url postgres://keeper@db/sigma_keeper \
+    --database-url postgres://reader@db/perp_indexer \
+    --deployment /etc/sigma/perp.mainnet.json \
+    --rpc-url https://fullnode.example:443 \
+    --chain-id <chain id> \
+    --key-file /etc/sigma/keeper.key \
+    --oracle-updates-url https://oracle.example/v1/updates
+```
+
+The key needs gas and no capability; give the keeper a key of its own. An execution deletes its
+ticket, whose storage rebate usually outweighs what the execution costs:
+`perp_keeper_gas_spent_total` and `perp_keeper_gas_rebated_total` count the two cases.
+
+`scripts/localnet/keeper_smoke.py` checks the details path alone, against two scratch databases.
+`scripts/localnet/keeper_check.py` runs the keeper on the same held stack as `check.py` (a fresh
+one: it switches the market to a signed source) and checks, in nine phases: startup checks, a stop
+loss / take profit on the index price (waiting, simulated in a dry run, executed live), a take
+profit on the book price, a standalone stop on the mark price, the tickets it leaves alone, a
+market order the book is too thin for (retried by simulation, no gas spent), a fill too far from
+the index price (held back), a stop only the oracle service's newer price triggers (executed with
+the signed prices relayed in front of it) and shutdown. Every ticket in it commits to what the
+keeper answers for its details, so each execution is also the engine checking the keeper's
+encoding. The front end's side of the same path, `tickets.ts` and the transaction builders, is
+checked by perp-web's `scripts/haneul-localnet/keeper.ts` on its localnet fixture, with the keeper
+running on its key (`fixture.mjs keeper`), the fixture's deployment file and price service.
