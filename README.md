@@ -276,7 +276,7 @@ once its trigger price no longer crosses. The engine fills a market order at any
 execution whose simulated fill strays from the index price by more than `--max-slippage-bps`
 (10%) is held back and alerted on. Tickets the engine would never take are left alone and counted
 on `/status` and `/metrics`: a stop loss / take profit without a position on its side, an expired
-ticket, a ticket whose details the keeper never got. TWAP tickets are not executed yet.
+ticket, a ticket whose details the keeper never got.
 
 ```bash
 target/release/perp-keeper \
@@ -293,15 +293,37 @@ The key needs gas and no capability; give the keeper a key of its own. An execut
 ticket, whose storage rebate usually outweighs what the execution costs:
 `perp_keeper_gas_spent_total` and `perp_keeper_gas_rebated_total` count the two cases.
 
+### Running the TWAP tickets
+
+The same rounds run the TWAP tickets that name the keeper, after the stops and oldest first, from
+their progress as the indexer last saw it (`schedule`, the way `perpetuals_orders::twap_orders`
+judges it). The first chunk runs as soon as the ticket and its details are seen, every later one
+once the execution gap has passed since the last attempt; each is `twap_orders::execute` asked for
+the target chunk, an immediate-or-cancel order the engine bounds by the ticket's maximum slippage
+around the mark price and tops up with what earlier chunks did not fill. A ticket whose whole size
+is processed is finalized. A ticket the engine no longer runs, past its expiry, past its first-run
+deadline without a first chunk, or spoiled (nothing filled within its retry window), is cancelled
+10 s (`GRACE_MS`) after the deadline by the keeper's clock, so that the chain's clock has passed
+it too. Either way the engine releases the collateral the position no longer needs.
+
+Each chunk pays the keeper the share of the ticket's gas that its fill earned; finalizing or
+cancelling hands it what is left. A chunk deletes no ticket, so unlike a stop it costs more than its
+rebate. Left alone and counted with a `twap_` prefix: a reduce-only ticket without a position its
+side reduces, a ticket whose details the keeper never got, details the engine never runs on the
+market (`twap_invalid`), and a ticket whose first chunk keeps failing, which cannot spoil and is
+left to its owner.
+
 `scripts/localnet/keeper_smoke.py` checks the details path alone, against two scratch databases.
 `scripts/localnet/keeper_check.py` runs the keeper on the same held stack as `check.py` (a fresh
-one: it switches the market to a signed source) and checks, in nine phases: startup checks, a stop
+one: it switches the market to a signed source) and checks, in ten phases: startup checks, a stop
 loss / take profit on the index price (waiting, simulated in a dry run, executed live), a take
-profit on the book price, a standalone stop on the mark price, the tickets it leaves alone, a
-market order the book is too thin for (retried by simulation, no gas spent), a fill too far from
-the index price (held back), a stop only the oracle service's newer price triggers (executed with
-the signed prices relayed in front of it) and shutdown. Every ticket in it commits to what the
-keeper answers for its details, so each execution is also the engine checking the keeper's
+profit on the book price, a standalone stop on the mark price, the tickets it leaves alone, a market
+order the book is too thin for (retried by simulation, no gas spent), a fill too far from the index
+price (held back), TWAP tickets (chunks on their gaps and finalized, left alone, cancelled once
+expired, past their first-run deadline or spoiled, a reduce-only one closing the long, with the net
+gas of each kind of transaction printed), a stop only the oracle service's newer price triggers
+(executed with the signed prices relayed in front of it) and shutdown. Every ticket in it commits to
+what the keeper answers for its details, so each execution is also the engine checking the keeper's
 encoding. The front end's side of the same path, `tickets.ts` and the transaction builders, is
 checked by perp-web's `scripts/haneul-localnet/keeper.ts` on its localnet fixture, with the keeper
 running on its key (`fixture.mjs keeper`), the fixture's deployment file and price service.

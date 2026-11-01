@@ -1,12 +1,14 @@
 // Copyright (c) 2026 Geunhwa Jeong
 // SPDX-License-Identifier: Apache-2.0
 
-//! The execution loop. Every round reads the open stop tickets that name the keeper, their
-//! details, and their markets and positions; judges each ticket the way the engine would
-//! (`trigger`); and executes the ones whose trigger price has crossed, stop losses first and
-//! larger orders before smaller ones, one transaction each. The full node simulates every
-//! execution before it is signed, so a ticket the engine would refuse costs nothing; one that
-//! keeps failing is tried less and less often, until its trigger price is no longer crossed.
+//! The execution loop. Every round reads the open stop and TWAP tickets that name the keeper,
+//! their details, and their markets and positions; judges each ticket the way the engine would
+//! (`trigger`, `schedule`); and sends one transaction for each ticket that needs one: first the
+//! stops whose trigger price has crossed, stop losses first and larger orders before smaller
+//! ones, then the TWAP tickets, oldest first: the chunks that are due, the finalizations and the
+//! cancellations. The full node simulates every transaction before it is signed, so one the
+//! engine would refuse costs nothing; a ticket that keeps failing is tried less and less often,
+//! until it no longer needs a transaction.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use bigdecimal::{BigDecimal, Zero};
+use bigdecimal::{BigDecimal, Signed, Zero};
 use haneul_crypto::HaneulSigner;
 use haneul_sdk_types::{Address, Transaction};
 use haneul_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -24,7 +26,7 @@ use perp_bot_common::deployment::db_id;
 use perp_bot_common::keys::Key;
 use perp_bot_common::oracle::{self, Relay, SignedUpdate, Updates};
 use perp_bot_common::store::{MarketRow, Store as Snapshots};
-use perp_bot_common::tickets::{StandaloneStop, StopLossTakeProfit};
+use perp_bot_common::tickets::{StandaloneStop, StopLossTakeProfit, TwapDetails};
 use perp_engine::MarketState;
 use perp_types::perpetuals::Event;
 use perp_types::types::U256;
@@ -35,9 +37,10 @@ use crate::details::Submission;
 use crate::metrics::Metrics;
 use crate::now_ms;
 use crate::ptb::{Builder, Details, Engine, Ticket};
+use crate::schedule::{self, Plan, Progress};
 use crate::setup::{Market, Oracle};
 use crate::status::{Board, LastExecution};
-use crate::store::{Indexer, OpenTicket, Store};
+use crate::store::{Indexer, OpenTicket, OpenTwap, Store};
 use crate::trigger::{self, Prices, Verdict};
 
 const HANEUL: &str = "0x2::haneul::HANEUL";
@@ -48,6 +51,9 @@ const REFRESH_EVERY: Duration = Duration::from_secs(60);
 const JUST_EXECUTED_FOR: Duration = Duration::from_secs(60);
 /// `stop_orders::EWrongOrderDetails`.
 const WRONG_ORDER_DETAILS: u64 = 6202;
+/// `twap_orders::EInvalidOrderDetails`, which also stands for details that do not hash to the
+/// ticket's commitment.
+const INVALID_TWAP_DETAILS: u64 = 6300;
 
 pub struct Settings {
     pub dry_run: bool,
@@ -140,20 +146,79 @@ impl Revealed {
     }
 }
 
-/// A triggered ticket, with what its execution needs.
+/// A TWAP ticket's details, read back from the keeper's database.
+fn read_twap(text: &str) -> anyhow::Result<TwapDetails> {
+    match serde_json::from_str::<Submission>(text)? {
+        Submission::Twap(d) => d.to_ticket(),
+        _ => bail!("stop details under a TWAP ticket"),
+    }
+}
+
+/// A ticket that needs a transaction, with what the transaction needs.
 struct Candidate {
     ticket_id: String,
     ticket: Ticket,
     account_id: u64,
-    details: Revealed,
     /// Index into the markets.
     market: usize,
-    stop_loss: bool,
-    /// The order's size at the index price: larger orders go first.
-    notional: BigDecimal,
-    /// The index price the trigger was judged on.
-    index: BigDecimal,
     relay: Option<(Relay, Vec<SignedUpdate>)>,
+    job: Job,
+}
+
+enum Job {
+    /// A stop ticket whose trigger price has crossed.
+    Stop {
+        details: Revealed,
+        stop_loss: bool,
+        /// The order's size at the index price: larger orders go first.
+        notional: BigDecimal,
+        /// The index price the trigger was judged on.
+        index: BigDecimal,
+    },
+    /// A TWAP ticket's next step: a chunk, its finalization or its cancellation.
+    Twap {
+        details: TwapDetails,
+        plan: Plan,
+        /// The last attempt the indexer had seen, to tell when it has seen this one.
+        last_attempt_ms: u64,
+    },
+}
+
+impl Job {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Stop { details, .. } => details.kind(),
+            Self::Twap {
+                plan: Plan::Run { .. },
+                ..
+            } => "twap_chunk",
+            Self::Twap {
+                plan: Plan::Complete,
+                ..
+            } => "twap_finalize",
+            Self::Twap { .. } => "twap_cancel",
+        }
+    }
+
+    /// What the logs say about the transaction besides its kind.
+    fn note(&self) -> String {
+        match self {
+            Self::Stop { stop_loss, .. } => format!("stop_loss={stop_loss}"),
+            Self::Twap {
+                plan: Plan::Run { amount },
+                ..
+            } => format!("amount={amount}"),
+            Self::Twap { plan, .. } => plan.state().to_owned(),
+        }
+    }
+
+    /// The index price a market order's fill is held against; `None` for orders with a limit.
+    fn market_order_index(&self) -> Option<&BigDecimal> {
+        match self {
+            Self::Stop { details, index, .. } if !details.is_limit_order() => Some(index),
+            _ => None,
+        }
+    }
 }
 
 /// A market as a round sees it.
@@ -173,6 +238,9 @@ pub struct Executor {
     me: String,
     failures: HashMap<String, Failure>,
     just_executed: HashMap<String, Instant>,
+    /// TWAP tickets whose chunk was sent, with the last attempt the indexer had seen then: left
+    /// alone until the indexer reports another one.
+    just_ran: HashMap<String, (Instant, u64)>,
     gas_price: Option<(u64, Instant)>,
     gas_checked: Option<Instant>,
 }
@@ -185,6 +253,7 @@ impl Executor {
             me,
             failures: HashMap::new(),
             just_executed: HashMap::new(),
+            just_ran: HashMap::new(),
             gas_price: None,
             gas_checked: None,
         }
@@ -238,8 +307,8 @@ impl Executor {
         self.p.board.round_done();
     }
 
-    /// The triggered tickets in the order they are executed, counting every open ticket by
-    /// state.
+    /// The tickets that need a transaction, in the order they are sent, counting every open
+    /// ticket by state; a TWAP ticket's state is prefixed with `twap_`.
     async fn candidates(
         &mut self,
         now: i64,
@@ -251,15 +320,41 @@ impl Executor {
             .open_stop_tickets(&self.me)
             .await
             .context("Failed to read the open tickets")?;
-        let open: HashSet<&str> = tickets.iter().map(|t| t.ticket_id.as_str()).collect();
+        let twaps = self
+            .p
+            .indexer
+            .open_twap_tickets(&self.me)
+            .await
+            .context("Failed to read the open TWAP tickets")?;
+        let open: HashSet<&str> = tickets
+            .iter()
+            .map(|t| t.ticket_id.as_str())
+            .chain(twaps.iter().map(|t| t.ticket_id.as_str()))
+            .collect();
         self.failures.retain(|id, _| open.contains(id.as_str()));
         self.just_executed
             .retain(|id, at| open.contains(id.as_str()) && at.elapsed() < JUST_EXECUTED_FOR);
-        if tickets.is_empty() {
+        self.just_ran
+            .retain(|id, (at, _)| open.contains(id.as_str()) && at.elapsed() < JUST_EXECUTED_FOR);
+        for twap in &twaps {
+            let seen = twap.last_attempt_ms.unwrap_or(0).max(0) as u64;
+            if self
+                .just_ran
+                .get(&twap.ticket_id)
+                .is_some_and(|(_, before)| *before != seen)
+            {
+                self.just_ran.remove(&twap.ticket_id);
+            }
+        }
+        if tickets.is_empty() && twaps.is_empty() {
             return Ok(Vec::new());
         }
 
-        let commitments: Vec<Vec<u8>> = tickets.iter().map(|t| t.commitment.clone()).collect();
+        let commitments: Vec<Vec<u8>> = tickets
+            .iter()
+            .map(|t| t.commitment.clone())
+            .chain(twaps.iter().map(|t| t.commitment.clone()))
+            .collect();
         let details = self
             .p
             .store
@@ -312,6 +407,11 @@ impl Executor {
             .iter()
             .map(|p| ((p.market.clone(), p.account_id), &p.base))
             .collect();
+        let lots: HashMap<&str, u64> = snapshot
+            .markets
+            .iter()
+            .map(|r| (r.market.as_str(), r.lot_size.max(0) as u64))
+            .collect();
 
         let mut candidates = Vec::new();
         for ticket in &tickets {
@@ -329,11 +429,43 @@ impl Executor {
             }
             *states.entry(state.to_owned()).or_default() += 1;
         }
-        candidates.sort_by(|a, b| {
-            b.stop_loss
-                .cmp(&a.stop_loss)
-                .then_with(|| b.notional.cmp(&a.notional))
+        candidates.sort_by(|a, b| match (&a.job, &b.job) {
+            (
+                Job::Stop {
+                    stop_loss: a_loss,
+                    notional: a_notional,
+                    ..
+                },
+                Job::Stop {
+                    stop_loss: b_loss,
+                    notional: b_notional,
+                    ..
+                },
+            ) => b_loss.cmp(a_loss).then_with(|| b_notional.cmp(a_notional)),
+            _ => std::cmp::Ordering::Equal,
         });
+
+        for twap in &twaps {
+            let state =
+                match self.assess_twap(twap, &details, &priced, &paused, &lots, &positions, now) {
+                    Ok(candidate) => {
+                        let state = match &candidate.job {
+                            Job::Twap { plan, .. } => plan.state(),
+                            Job::Stop { .. } => "triggered",
+                        };
+                        candidates.push(candidate);
+                        state
+                    }
+                    Err(state) => state,
+                };
+            if !matches!(
+                state,
+                "due" | "complete" | "expired" | "first_run_expired" | "spoiled" | "backoff"
+            ) {
+                self.failures.remove(&twap.ticket_id);
+            }
+            *states.entry(format!("twap_{state}")).or_default() += 1;
+        }
         Ok(candidates)
     }
 
@@ -411,21 +543,134 @@ impl Executor {
             ticket_id: ticket.ticket_id.clone(),
             ticket: Ticket { id, account },
             account_id: ticket.account_id.max(0) as u64,
-            notional: BigDecimal::new(revealed.size().into(), 9) * &index_price,
-            details: revealed,
             market: index,
-            stop_loss,
-            index: index_price,
             relay: priced.relay.clone(),
+            job: Job::Stop {
+                notional: BigDecimal::new(revealed.size().into(), 9) * &index_price,
+                details: revealed,
+                stop_loss,
+                index: index_price,
+            },
+        })
+    }
+
+    /// A TWAP ticket's next transaction, or the state that keeps it from one.
+    #[allow(clippy::too_many_arguments)]
+    fn assess_twap(
+        &self,
+        twap: &OpenTwap,
+        details: &HashMap<Vec<u8>, String>,
+        priced: &HashMap<String, Priced>,
+        paused: &HashSet<String>,
+        lots: &HashMap<&str, u64>,
+        positions: &HashMap<(String, i64), &BigDecimal>,
+        now: i64,
+    ) -> Result<Candidate, &'static str> {
+        if self.just_executed.contains_key(&twap.ticket_id)
+            || self.just_ran.contains_key(&twap.ticket_id)
+        {
+            return Err("just_executed");
+        }
+        let Some(text) = details.get(&twap.commitment) else {
+            return Err("no_details");
+        };
+        let revealed = match read_twap(text) {
+            Ok(d) if d.commitment().as_slice() == twap.commitment.as_slice() => d,
+            _ => return Err("unreadable"),
+        };
+        let Some(index) = self.p.markets.iter().position(|m| m.db_id == twap.market) else {
+            return Err("unknown_market");
+        };
+        let market = &self.p.markets[index];
+        let Some(&lot_size) = lots.get(market.db_id.as_str()) else {
+            return Err("unknown_market");
+        };
+        let raw = |v: Option<i64>| v.unwrap_or(0).max(0) as u64;
+        let progress = Progress {
+            processed: raw(twap.processed_amount),
+            scheduled: raw(twap.scheduled_amount),
+            last_attempt_ms: raw(twap.last_attempt_ms),
+            retry_anchor_ms: raw(twap.retry_anchor_ms),
+        };
+        let plan = schedule::plan(&revealed, &progress, lot_size, now.max(0) as u64);
+        let runs = matches!(plan, Plan::Run { .. });
+        if !runs && plan != Plan::Complete && !plan.cancels() {
+            return Err(plan.state());
+        }
+        // A chunk needs the market running and a price to relay; finalizing and cancelling
+        // release collateral only while the market runs, and need no price while it is paused.
+        let is_paused = paused.contains(&market.db_id);
+        if runs && is_paused {
+            return Err("market_paused");
+        }
+        let relay = match priced.get(&market.db_id) {
+            Some(priced) => priced.relay.clone(),
+            None if runs || !is_paused => return Err("no_price"),
+            None => None,
+        };
+        if runs && revealed.reduce_only {
+            let zero = BigDecimal::zero();
+            let base = positions
+                .get(&(market.db_id.clone(), twap.account_id))
+                .copied()
+                .unwrap_or(&zero);
+            // An ask (`side`) reduces a long, a bid a short.
+            let reduces = if revealed.side {
+                base.is_positive()
+            } else {
+                base.is_negative()
+            };
+            if !reduces {
+                return Err("no_position");
+            }
+        }
+        if self
+            .failures
+            .get(&twap.ticket_id)
+            .is_some_and(|f| f.until > Instant::now())
+        {
+            return Err("backoff");
+        }
+        let (Ok(id), Ok(account)) = (
+            Address::from_str(&twap.ticket_id),
+            Address::from_str(&twap.account),
+        ) else {
+            return Err("unreadable");
+        };
+        Ok(Candidate {
+            ticket_id: twap.ticket_id.clone(),
+            ticket: Ticket { id, account },
+            account_id: twap.account_id.max(0) as u64,
+            market: index,
+            relay,
+            job: Job::Twap {
+                details: revealed,
+                plan,
+                last_attempt_ms: progress.last_attempt_ms,
+            },
         })
     }
 
     async fn execute(&mut self, c: &Candidate) {
-        let kind = c.details.kind();
-        let feeds = self.p.markets[c.market].feeds;
+        let kind = c.job.kind();
+        let market = &self.p.markets[c.market];
+        let (feeds, clearing_house) = (market.feeds, market.clearing_house);
         let mut b = Builder::new(&self.p.engine, &ObjectInput::new);
-        b.refresh(c.relay.as_ref().map(|(r, u)| (r, u.as_slice())))
-            .execute(&c.ticket, c.details.details(), &feeds);
+        b.refresh(c.relay.as_ref().map(|(r, u)| (r, u.as_slice())));
+        match &c.job {
+            Job::Stop { details, .. } => b.execute(&c.ticket, details.details(), &feeds),
+            Job::Twap {
+                details,
+                plan: Plan::Run { amount },
+                ..
+            } => b.run_chunk(&c.ticket, clearing_house, details, *amount, &feeds),
+            Job::Twap {
+                details,
+                plan: Plan::Complete,
+                ..
+            } => b.finalize(&c.ticket, clearing_house, details, &feeds),
+            Job::Twap { .. } => b.cancel_twap(&c.ticket, clearing_house, &feeds),
+        };
         let commands = b.commands();
         let tx = b.finish();
 
@@ -435,9 +680,12 @@ impl Executor {
                 self.count(kind, "refused");
                 match &e {
                     BuildError::Aborted(abort) => {
-                        let level = (abort.module == "stop_orders"
-                            && abort.code == WRONG_ORDER_DETAILS)
-                            .then_some(Level::Critical);
+                        let level = matches!(
+                            (abort.module.as_str(), abort.code),
+                            ("stop_orders", WRONG_ORDER_DETAILS)
+                                | ("twap_orders", INVALID_TWAP_DETAILS)
+                        )
+                        .then_some(Level::Critical);
                         self.failed(c, &describe(abort, &commands), level);
                     }
                     other => self.failed(c, &other.to_string(), None),
@@ -458,7 +706,7 @@ impl Executor {
 
         // The engine fills a market order at any price, so where the simulated one filled is
         // read before it is sent.
-        let simulated = if self.p.settings.dry_run || !c.details.is_limit_order() {
+        let simulated = if self.p.settings.dry_run || c.job.market_order_index().is_some() {
             match self.p.chain.simulate(&tx).await {
                 Ok(outcome) if outcome.success => Some(outcome),
                 Ok(outcome) => {
@@ -475,8 +723,8 @@ impl Executor {
             None
         };
         if let Some(outcome) = &simulated
-            && !c.details.is_limit_order()
-            && let Some(message) = self.strays(c, outcome)
+            && let Some(index) = c.job.market_order_index()
+            && let Some(message) = self.strays(c, index, outcome)
         {
             self.count(kind, "guarded");
             self.failed(c, &message, Some(Level::Warning));
@@ -490,7 +738,7 @@ impl Executor {
                 market = ticker,
                 ticket = c.ticket_id,
                 kind,
-                stop_loss = c.stop_loss,
+                what = c.job.note(),
                 relayed,
                 "Would execute"
             );
@@ -524,15 +772,14 @@ impl Executor {
                     market = ticker,
                     ticket = c.ticket_id,
                     kind,
-                    stop_loss = c.stop_loss,
+                    what = c.job.note(),
                     digest = outcome.digest,
                     relayed,
                     gas_used = outcome.gas_used,
                     "Executed"
                 );
                 self.failures.remove(&c.ticket_id);
-                self.just_executed
-                    .insert(c.ticket_id.clone(), Instant::now());
+                self.leave_alone(c);
                 self.p.board.update(|s| {
                     s.executions += 1;
                     s.last_execution = Some(LastExecution {
@@ -555,6 +802,25 @@ impl Executor {
                 // It may still land: left alone until the indexer tells.
                 self.count(kind, "unknown");
                 warn!(ticket = c.ticket_id, kind, "No answer: {e}");
+                self.leave_alone(c);
+            }
+        }
+    }
+
+    /// Leaves a ticket alone while the indexer catches up with its transaction: a TWAP ticket
+    /// whose chunk was sent until the indexer reports another attempt, any other until it is no
+    /// longer open; either for at most `JUST_EXECUTED_FOR`.
+    fn leave_alone(&mut self, c: &Candidate) {
+        match &c.job {
+            Job::Twap {
+                plan: Plan::Run { .. },
+                last_attempt_ms,
+                ..
+            } => {
+                self.just_ran
+                    .insert(c.ticket_id.clone(), (Instant::now(), *last_attempt_ms));
+            }
+            _ => {
                 self.just_executed
                     .insert(c.ticket_id.clone(), Instant::now());
             }
@@ -562,18 +828,18 @@ impl Executor {
     }
 
     /// Why a simulated market order's fill strays too far from the index price, if it does.
-    fn strays(&self, c: &Candidate, outcome: &Outcome) -> Option<String> {
+    fn strays(&self, c: &Candidate, index: &BigDecimal, outcome: &Outcome) -> Option<String> {
         let price = fill_price(&outcome.events, &self.p.engine.types_package, c.account_id)?;
-        if c.index.is_zero() {
+        if index.is_zero() {
             return None;
         }
-        let bps = (&price - &c.index).abs() * BigDecimal::from(10_000) / &c.index;
+        let bps = (&price - index).abs() * BigDecimal::from(10_000) / index;
         (bps > self.p.settings.max_slippage_bps).then(|| {
             format!(
                 "the market order would fill at {}, {} bps from the index price {}, beyond --max-slippage-bps {}: held back",
                 price.with_scale(2),
                 bps.with_scale(1),
-                c.index.with_scale(2),
+                index.with_scale(2),
                 self.p.settings.max_slippage_bps
             )
         })
@@ -592,7 +858,7 @@ impl Executor {
         );
         failure.until = Instant::now() + wait;
         let count = failure.count;
-        let kind = c.details.kind();
+        let kind = c.job.kind();
         warn!(
             ticket = c.ticket_id,
             kind,
@@ -838,7 +1104,25 @@ fn describe(abort: &Abort, commands: &str) -> String {
         ("stop_orders", 6208) => Some("the ticket is of the other type"),
         ("stop_orders", 6209) => Some("the order would neither fill nor rest"),
         ("stop_orders", 6210) => Some("the gas price is not the reference gas price"),
+        ("twap_orders", INVALID_TWAP_DETAILS) => Some(
+            "the details do not hash to the ticket's commitment, or cannot be split into chunks",
+        ),
+        ("twap_orders", 6301) => Some("the ticket has expired"),
+        ("twap_orders", 6302) => {
+            Some("the amount is not the details' chunk, or more than one execution may take")
+        }
+        ("twap_orders", 6303) => Some("the execution gap since the last attempt has not passed"),
+        ("twap_orders", 6304) => Some("the ticket's whole size is processed"),
+        ("twap_orders", 6305) => Some("nothing filled within the retry window: the ticket spoiled"),
+        ("twap_orders", 6306) => Some("the keeper is not an executor of the ticket"),
+        ("twap_orders", 6308) => Some("the ticket's size is not processed yet"),
+        ("twap_orders", 6309) => Some("the ticket is for another clearing house"),
+        ("twap_orders", 6310) => Some("the first chunk's deadline has passed"),
+        ("twap_orders", 6311) => Some("the gas price is not the reference gas price"),
+        ("twap_orders", 6312) => Some("the size or the chunk is not in lots"),
+        ("clearing_house", 1) => Some("the order is empty: a reduce-only order with no position"),
         ("clearing_house", 9) => Some("the reduce-only order has no position to reduce"),
+        ("clearing_house", 30) => Some("the account lacks the collateral the filled order needs"),
         ("clearing_house", 32) => Some("the market is paused"),
         ("clearing_house", 40) => Some("the account lacks the free collateral for the order"),
         ("clearing_house", 45) => Some("the book is too thin to fill the market order"),
@@ -1014,5 +1298,8 @@ mod tests {
             "amountUncertaintyBps": "0", "maxOneExecutionAmountBps": "2500", "side": false,
             "size": "1000000000", "maxSlippageBps": "100", "reduceOnly": false, "salt": "00"}}"#;
         assert!(Revealed::read(twap).is_err());
+        let details = read_twap(twap).unwrap();
+        assert_eq!((details.chunks_amount, details.size), (4, 1_000_000_000));
+        assert!(read_twap(text).is_err());
     }
 }

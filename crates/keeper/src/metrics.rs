@@ -12,16 +12,20 @@ pub struct Metrics {
     pub rounds: IntCounter,
     /// Open tickets that name the keeper, by state as of the last round: triggered, waiting,
     /// expired, no_position, mark_unavailable, invalid, no_details, unreadable, unknown_market,
-    /// market_paused, no_price, backoff, just_executed.
+    /// market_paused, no_price, backoff, just_executed; for TWAP tickets, prefixed with `twap_`:
+    /// due, scheduled, complete, lapsing, expired, first_run_expired, spoiled, invalid and the
+    /// shared ones.
     pub tickets: IntGaugeVec,
-    /// Executions by kind and result: executed, simulated (dry run), refused (would abort or
-    /// failed to build), guarded (the fill strayed from the index), rejected, unknown, failed
-    /// (landed and failed).
+    /// Transactions by kind (stop_loss_take_profit, standalone_stop, twap_chunk, twap_finalize,
+    /// twap_cancel) and result: executed, simulated (dry run), refused (would abort or failed to
+    /// build), guarded (the fill strayed from the index), rejected, unknown, failed (landed and
+    /// failed).
     pub executions: IntCounterVec,
     pub relayed_updates: IntCounter,
     /// The net gas of executions, as the effects count it: computation and storage less the
-    /// storage rebate. An execution deletes its ticket, whose rebate can outweigh the rest; such
-    /// an execution adds what it gained to `gas_rebated` instead.
+    /// storage rebate. A stop execution, a TWAP finalization or cancellation deletes its ticket,
+    /// whose rebate can outweigh the rest; such a transaction adds what it gained to
+    /// `gas_rebated` instead. The gas a ticket hands the keeper is not counted here.
     pub gas_spent: IntCounter,
     pub gas_rebated: IntCounter,
     pub gas_balance: Gauge,

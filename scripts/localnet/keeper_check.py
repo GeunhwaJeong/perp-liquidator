@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Geunhwa Jeong
 # SPDX-License-Identifier: Apache-2.0
-"""Run the keeper against a local network and check how it executes stop tickets.
+"""Run the keeper against a local network and check how it executes stop and TWAP tickets.
 
     scripts/localnet/keeper_check.py --perp-dex <engine copy> --work <localnet work dir> \\
         --database-url <indexer database> --keeper <perp-keeper binary>
@@ -27,10 +27,15 @@ encoding of the details. Then:
    costs no gas;
 7. a market order whose fill strays beyond --max-slippage-bps from the index price is held back
    and alerted on;
-8. with the market on a signed source whose price goes stale after ten seconds and nothing
+8. TWAP tickets: one buying in three chunks runs each chunk once the gap since the last one has
+   passed and is finalized; a reduce-only one without a position to reduce and one without
+   details are left alone; an expired one and one past its first-run deadline are cancelled; one
+   that fills nothing spoils after its retry window and is cancelled; a reduce-only one closes the
+   long it opened. The net gas of each kind of TWAP transaction is printed;
+9. with the market on a signed source whose price goes stale after ten seconds and nothing
    relaying, a stop that only the oracle service's newer price triggers is executed with the
    signed prices relayed in front of it;
-9. it stops cleanly on SIGTERM.
+10. it stops cleanly on SIGTERM.
 
 Refuses to run anywhere but a local chain.
 """
@@ -38,6 +43,7 @@ Refuses to run anywhere but a local chain.
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -367,6 +373,39 @@ def main():
         cmds += ["--transfer-objects", "[g]", obj(me)]
         ptb(f"{who} cancels its ticket", cmds)
 
+    def twap(*, side, size, chunks, gap_ms, uncertainty_ms=1_000, retry_ms=30_000, max_one_bps=10_000,
+             reduce_only=False, expire=None, first_run_expire=None):
+        """A TWAP order, each chunk an immediate-or-cancel order within 5% of the mark price."""
+        d = {"executionGapMs": str(gap_ms), "executionTimeUncertaintyMs": str(uncertainty_ms), "chunksAmount": str(chunks),
+             "smallTailMergeThresholdBps": "0", "timeForRetryMs": str(retry_ms), "amountUncertaintyBps": "0",
+             "maxOneExecutionAmountBps": str(max_one_bps), "side": side, "size": str(size), "maxSlippageBps": "500",
+             "reduceOnly": reduce_only, "salt": salt()}
+        if expire is not None:
+            d["expireTimestampMs"] = str(expire)
+        if first_run_expire is not None:
+            d["firstRunExpireTimestampMs"] = str(first_run_expire)
+        return {"kind": "twap", "details": d}
+
+    def create_twap(label, who, commitment, executors=None):
+        a = acct[who]
+        cmds = ["--split-coins", "gas", f"[{TICKET_GAS}]", "--assign", "g"]
+        cmds += ["--make-move-vec", "<address>", "[" + ", ".join(obj(e) for e in executors or [keeper]) + "]", "--assign", "execs"]
+        cmds += call(f"{ORDERS}::twap_orders::create_twap_order_ticket", [TUSD, ADMIN], obj(a["obj"]), obj(a["cap"]), obj(ch), obj(registry),
+                     "execs", "none", "g.0", vec_u8(bytes.fromhex(commitment)))
+        j = ptb(label, cmds)
+        return events(j, "::events::CreatedTWAPOrderTicket")[0]["ticket_id"]
+
+    def twap_ticket(label, who, body):
+        """The front end's way, as for a stop ticket."""
+        return create_twap(label, who, post_details(body)["commitment"])
+
+    def user_cancel_twap(who, ticket_id):
+        a = acct[who]
+        cmds = call(f"{ORDERS}::twap_orders::user_cancel_twap_order", [TUSD, ADMIN], obj(a["obj"]), obj(a["cap"]), obj(ch), obj(pfs_btc),
+                    obj(pfs_tusd), obj(ticket_id), CLOCK, obj(registry), assign="g")
+        cmds += ["--transfer-objects", "[g]", obj(me)]
+        ptb(f"{who} cancels its TWAP ticket", cmds)
+
     def ticket_status(ticket_id):
         return sql(f"SELECT status FROM order_tickets WHERE ticket_id = '{ticket_id}'")
 
@@ -546,6 +585,9 @@ def main():
         still_open = [ticket_status(x) for x in (ticket_d, ticket_e, ticket_g, ticket_f)]
         executed_after = executions("stop_loss_take_profit", "executed") + executions("standalone_stop", "executed")
         check("none of them is executed", still_open == ["open"] * 4 and executed_after == executed_before, str(still_open))
+        # D would fire once W holds a long, as a ticket left over from a closed position does.
+        for left in (ticket_d, ticket_e, ticket_g, ticket_f):
+            cancel_ticket("W", left)
 
         # -------------------------------------------------------------- 6. too thin a book
         section("6. A market order the book is too thin for")
@@ -576,10 +618,77 @@ def main():
         cancel_ticket("W", ticket_i)
         clear_book()
         ladder(30_000)
+
+        # -------------------------------------------------------------- 8. TWAP tickets
+        section("8. TWAP tickets")
+        THIRD = 3 * TENTH
+        first_checkpoint = int(grpc("haneul.rpc.v2.LedgerService/GetServiceInfo", {})["checkpointHeight"])
+        ticket_k = twap_ticket("K: W buys 0.3 in three chunks, 3 s apart", "W", twap(side=BID, size=THIRD, chunks=3, gap_ms=3_000))
+        finalized = wait_status(ticket_k, "finalized", 90)
+        check("runs its three chunks and finalizes it: the engine takes the keeper's TWAP encoding", finalized is not None,
+              log_of("live")[-1200:])
+        wait_indexed()
+        check("W is long 0.3", base("W") == 0.3, f"W {base('W')}")
+        chunks, finalized = executions("twap_chunk", "executed"), executions("twap_finalize", "executed")
+        check("counted as three chunks and a finalization", (chunks, finalized) == (3, 1), f"{chunks} chunks, {finalized} finalized")
+        check("no chunk refused: each is sent only once it is due", executions("twap_chunk", "refused") == 0, log_of("live")[-800:])
+        attempts = [int(x) for x in sql(
+            "SELECT string_agg(data->>'last_attempt_timestamp_ms', ',' ORDER BY checkpoint, tx_index) FROM raw_events "
+            f"WHERE name = 'ProcessedTWAPOrderTicket' AND checkpoint >= {first_checkpoint} "
+            f"AND (data->>'account_id')::BIGINT = {acct['W']['id']}").split(",") if x]
+        gaps = [later - earlier for earlier, later in zip(attempts, attempts[1:])]
+        check("each chunk on chain at least the 3 s gap after the one before", len(attempts) == 3 and all(g >= 3_000 for g in gaps),
+              f"attempts {attempts}, gaps {gaps}")
+
+        ticket_l = twap_ticket("L: a reduce-only bid, which does not reduce W's long", "W",
+                               twap(side=BID, size=TENTH, chunks=1, gap_ms=0, reduce_only=True))
+        ticket_m = create_twap("M: a TWAP whose details the keeper never got", "W", os.urandom(32).hex())
+        counted = wait_for(lambda: (lambda t: t if t.get("twap_no_position") and t.get("twap_no_details") else None)(tickets()), 30)
+        t = counted or tickets()
+        check("L counted as without a position to reduce, M as without details",
+              t.get("twap_no_position") == 1 and t.get("twap_no_details") == 1, str(t))
+        time.sleep(3)
+        check("neither runs", [ticket_status(ticket_l), ticket_status(ticket_m)] == ["open", "open"]
+              and executions("twap_chunk", "executed") == 3, str(tickets()))
+        user_cancel_twap("W", ticket_l)
+        user_cancel_twap("W", ticket_m)
+
+        now_ms = int(time.time() * 1000)
+        ticket_n = twap_ticket("N: a TWAP that expired 15 s ago", "W", twap(side=BID, size=TENTH, chunks=1, gap_ms=0, expire=now_ms - 15_000))
+        ticket_o = twap_ticket("O: a TWAP whose first chunk was due by 15 s ago", "W",
+                               twap(side=BID, size=TENTH, chunks=1, gap_ms=0, first_run_expire=now_ms - 15_000))
+        both = wait_for(lambda: ticket_status(ticket_n) == "canceled" and ticket_status(ticket_o) == "canceled", 40)
+        check("both cancelled by the keeper: the engine no longer runs them", both is not None, log_of("live")[-800:])
+        check("counted as cancellations, with no chunk run",
+              executions("twap_cancel", "executed") == 2 and executions("twap_chunk", "executed") == 3,
+              f"{executions('twap_cancel', 'executed')} cancelled, {executions('twap_chunk', 'executed')} chunks")
+
+        clear_book()
+        ticket_p = twap_ticket("P: W buys 0.1 in two chunks 2 s apart with no ask on the book, retried for 2 s", "W",
+                               twap(side=BID, size=TENTH, chunks=2, gap_ms=2_000, retry_ms=2_000))
+        spoiled = wait_status(ticket_p, "canceled", 60)
+        check("fills nothing, spoils after its retry window, and the keeper cancels it", spoiled is not None, log_of("live")[-1200:])
+        wait_indexed()
+        attempted = executions("twap_chunk", "executed") - 3
+        check("its attempts ran and W bought nothing", attempted >= 2 and base("W") == 0.3, f"{attempted} attempts, W {base('W')}")
+        ladder(30_000)
+
+        ticket_q = twap_ticket("Q: a reduce-only TWAP sells W's long 0.3 in one chunk", "W",
+                               twap(side=ASK, size=THIRD, chunks=1, gap_ms=0, reduce_only=True))
+        closed = wait_status(ticket_q, "finalized", 60)
+        check("runs and is finalized", closed is not None, log_of("live")[-800:])
+        wait_indexed()
+        check("W is flat", base("W") == 0, f"W {base('W')}")
+        by_kind = {}
+        for kind, used in re.findall(r'kind="?(twap_\w+)"?[^\n]*?gas_used=(-?\d+)', log_of("live")):
+            by_kind.setdefault(kind, []).append(int(used))
+        check("the net gas of every TWAP transaction is logged", sorted(by_kind) == ["twap_cancel", "twap_chunk", "twap_finalize"], str(by_kind))
+        print(f"   net gas per transaction, GEUNHWA (negative: the rebate outweighed the cost): {by_kind}")
+        print(f"   each ticket held {TICKET_GAS:,} GEUNHWA, paid to the keeper as its size filled or when it was cancelled")
         check("stops cleanly", stop(p) == 0)
 
-        # -------------------------------------------------------------- 8. signed prices
-        section("8. A stop only the oracle service's newer price triggers")
+        # -------------------------------------------------------------- 9. signed prices
+        section("9. A stop only the oracle service's newer price triggers")
         package_dir = Path(args.perp_dex).expanduser() / "packages/oracle_haneul"
         if not package_dir.exists():
             shutil.copytree(head / "packages/oracle_haneul", package_dir)
@@ -671,8 +780,8 @@ def main():
         check("the base feed holds the signed price now", int(feed["price"]) == served and int(time.time() * 1000) - int(feed["timestamp_ms"]) < 15_000, str(feed))
         cancel_open_orders("W")
 
-        # -------------------------------------------------------------- 9. shutdown
-        section("9. Shutdown")
+        # -------------------------------------------------------------- 10. shutdown
+        section("10. Shutdown")
         check("stops cleanly on SIGTERM", stop(p) == 0 and "Stopping" in log_of("oracle"))
     finally:
         pushing.clear()

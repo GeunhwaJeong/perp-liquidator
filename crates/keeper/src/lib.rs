@@ -5,8 +5,9 @@
 //! details, so the front end hands the details to the keeper before it asks for the ticket's
 //! transaction to be signed; the keeper checks that they hash to the commitment, keeps them in
 //! a database of its own and follows the indexer to see which tickets took them up. Given a
-//! deployment, a full node and a key, it also executes the stop tickets that name it once
-//! their trigger prices cross.
+//! deployment, a full node and a key, it also executes the tickets that name it: a stop ticket
+//! once its trigger price crosses, a TWAP ticket chunk by chunk on its schedule, finalized once
+//! its whole size is processed and cancelled once the engine no longer runs it.
 
 pub mod config;
 pub mod details;
@@ -14,6 +15,7 @@ pub mod executor;
 pub mod matcher;
 pub mod metrics;
 pub mod ptb;
+pub mod schedule;
 pub mod server;
 pub mod setup;
 pub mod status;

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The keeper's two databases. Its own holds the details, keyed by the commitment they hash to;
-//! the indexer's is only read, to tell which commitments a ticket on chain holds and which
-//! tickets are open.
+//! the indexer's is only read, to tell which commitments a ticket on chain holds, which tickets
+//! are open and how far the TWAP tickets have come.
 
 use std::collections::HashMap;
 
@@ -89,6 +89,32 @@ pub struct OpenTicket {
     pub stop_order_type: i64,
     #[diesel(sql_type = Binary)]
     pub commitment: Vec<u8>,
+}
+
+/// An open TWAP ticket the keeper may run, with its progress as the indexer last saw it.
+#[derive(Clone, Debug, QueryableByName)]
+pub struct OpenTwap {
+    #[diesel(sql_type = Text)]
+    pub ticket_id: String,
+    #[diesel(sql_type = BigInt)]
+    pub account_id: i64,
+    /// The account's shared object, which holds the ticket.
+    #[diesel(sql_type = Text)]
+    pub account: String,
+    /// The clearing house the ticket names, as the indexer writes it.
+    #[diesel(sql_type = Text)]
+    pub market: String,
+    #[diesel(sql_type = Binary)]
+    pub commitment: Vec<u8>,
+    /// From the last `ProcessedTWAPOrderTicket`; `None` before the first attempt.
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub processed_amount: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub scheduled_amount: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_attempt_ms: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub retry_anchor_ms: Option<i64>,
 }
 
 #[derive(QueryableByName)]
@@ -291,6 +317,26 @@ impl Indexer {
              FROM order_tickets t JOIN accounts a ON a.account_id = t.account_id \
              WHERE t.kind = 'stop' AND t.status = 'open' AND t.execution_domain IS NULL \
                AND t.executors @> jsonb_build_array($1::TEXT) \
+             ORDER BY t.created_checkpoint, t.ticket_id",
+        )
+        .bind::<Text, _>(executor)
+        .get_results(&mut conn)
+        .await?)
+    }
+
+    /// The open TWAP tickets that name `executor` and no execution domain, oldest first.
+    pub async fn open_twap_tickets(&self, executor: &str) -> anyhow::Result<Vec<OpenTwap>> {
+        let mut conn = self.pool.get().await.context("No database connection")?;
+        Ok(sql_query(
+            "SELECT t.ticket_id, t.account_id, a.object_id AS account, t.market, \
+                    t.encrypted_details AS commitment, \
+                    (t.twap_progress->>'processed_amount')::BIGINT AS processed_amount, \
+                    (t.twap_progress->>'scheduled_amount')::BIGINT AS scheduled_amount, \
+                    (t.twap_progress->>'last_attempt_timestamp_ms')::BIGINT AS last_attempt_ms, \
+                    (t.twap_progress->>'retry_anchor_timestamp_ms')::BIGINT AS retry_anchor_ms \
+             FROM order_tickets t JOIN accounts a ON a.account_id = t.account_id \
+             WHERE t.kind = 'twap' AND t.status = 'open' AND t.execution_domain IS NULL \
+               AND t.market IS NOT NULL AND t.executors @> jsonb_build_array($1::TEXT) \
              ORDER BY t.created_checkpoint, t.ticket_id",
         )
         .bind::<Text, _>(executor)
