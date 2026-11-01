@@ -17,7 +17,7 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use url::Url;
 
-const SCHEMA: [&str; 2] = [
+const SCHEMA: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS ticket_details (
         commitment      BYTEA   PRIMARY KEY,
         -- 'stop_loss_take_profit', 'standalone_stop' or 'twap'.
@@ -26,11 +26,16 @@ const SCHEMA: [&str; 2] = [
         details         TEXT    NOT NULL,
         submitted_at_ms BIGINT  NOT NULL,
         -- When a ticket holding the commitment was first seen in the indexer. Until then the
-        -- row is dropped once it is old enough.
+        -- row is dropped once it is old enough, or pushed out by newer details.
         matched_at_ms   BIGINT
     )",
     "CREATE INDEX IF NOT EXISTS ticket_details_unmatched
         ON ticket_details (submitted_at_ms) WHERE matched_at_ms IS NULL",
+    // The client that handed the details in, which caps how many of them wait. Added after the
+    // table was first deployed.
+    "ALTER TABLE ticket_details ADD COLUMN IF NOT EXISTS source TEXT",
+    "CREATE INDEX IF NOT EXISTS ticket_details_unmatched_by_source
+        ON ticket_details (source, submitted_at_ms) WHERE matched_at_ms IS NULL",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,8 +43,21 @@ pub enum Inserted {
     New,
     /// The same details were handed in before.
     Known,
-    /// Too many details are waiting for their tickets.
-    Full,
+}
+
+/// How many waiting details may stay.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_unmatched: i64,
+    pub max_per_source: i64,
+}
+
+/// What an insert pushed out to make room: the source's own oldest waiting details, then the
+/// oldest of all.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    pub source: usize,
+    pub capacity: usize,
 }
 
 #[derive(Clone, Debug, QueryableByName)]
@@ -58,12 +76,6 @@ pub struct Stored {
 struct CommitmentRow {
     #[diesel(sql_type = Binary)]
     commitment: Vec<u8>,
-}
-
-#[derive(QueryableByName)]
-struct CountRow {
-    #[diesel(sql_type = BigInt)]
-    count: i64,
 }
 
 #[derive(QueryableByName)]
@@ -168,46 +180,78 @@ impl Store {
         Ok(())
     }
 
+    /// Stores handed-in details. Details a ticket on chain already holds (`held`) are stored as
+    /// matched, whatever waits; others make room first, so a flood of made-up details pushes
+    /// out the oldest waiting ones, its own first, rather than shutting real ones out.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert(
         &self,
         commitment: &[u8; 32],
         kind: &str,
         details: &str,
         now_ms: i64,
-        max_unmatched: i64,
-    ) -> anyhow::Result<Inserted> {
+        source: &str,
+        held: bool,
+        limits: Limits,
+    ) -> anyhow::Result<(Inserted, Evicted)> {
         let mut conn = self.pool.get().await.context("No database connection")?;
         let known = sql_query("SELECT commitment FROM ticket_details WHERE commitment = $1")
             .bind::<Binary, _>(commitment.as_slice())
             .get_results::<CommitmentRow>(&mut conn)
             .await?;
         if !known.is_empty() {
-            return Ok(Inserted::Known);
+            if held {
+                sql_query(
+                    "UPDATE ticket_details SET matched_at_ms = $2
+                     WHERE commitment = $1 AND matched_at_ms IS NULL",
+                )
+                .bind::<Binary, _>(commitment.as_slice())
+                .bind::<BigInt, _>(now_ms)
+                .execute(&mut conn)
+                .await?;
+            }
+            return Ok((Inserted::Known, Evicted::default()));
         }
-        let waiting =
-            sql_query("SELECT count(*) AS count FROM ticket_details WHERE matched_at_ms IS NULL")
-                .get_result::<CountRow>(&mut conn)
-                .await?
-                .count;
-        if waiting >= max_unmatched {
-            return Ok(Inserted::Full);
+        let mut evicted = Evicted::default();
+        if !held {
+            evicted.source = sql_query(
+                "DELETE FROM ticket_details WHERE commitment IN (
+                    SELECT commitment FROM ticket_details
+                    WHERE matched_at_ms IS NULL AND source = $1
+                    ORDER BY submitted_at_ms DESC, commitment OFFSET $2)",
+            )
+            .bind::<Text, _>(source)
+            .bind::<BigInt, _>(limits.max_per_source - 1)
+            .execute(&mut conn)
+            .await?;
+            evicted.capacity = sql_query(
+                "DELETE FROM ticket_details WHERE commitment IN (
+                    SELECT commitment FROM ticket_details WHERE matched_at_ms IS NULL
+                    ORDER BY submitted_at_ms DESC, commitment OFFSET $1)",
+            )
+            .bind::<BigInt, _>(limits.max_unmatched - 1)
+            .execute(&mut conn)
+            .await?;
         }
         let rows = sql_query(
-            "INSERT INTO ticket_details (commitment, kind, details, submitted_at_ms)
-             VALUES ($1, $2, $3, $4) ON CONFLICT (commitment) DO NOTHING",
+            "INSERT INTO ticket_details (commitment, kind, details, submitted_at_ms, matched_at_ms, source)
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (commitment) DO NOTHING",
         )
         .bind::<Binary, _>(commitment.as_slice())
         .bind::<Text, _>(kind)
         .bind::<Text, _>(details)
         .bind::<BigInt, _>(now_ms)
+        .bind::<Nullable<BigInt>, _>(held.then_some(now_ms))
+        .bind::<Text, _>(source)
         .execute(&mut conn)
         .await?;
         // Zero rows: the same details came in at the same moment.
-        Ok(if rows == 1 {
+        let inserted = if rows == 1 {
             Inserted::New
         } else {
             Inserted::Known
-        })
+        };
+        Ok((inserted, evicted))
     }
 
     pub async fn details(&self, commitment: &[u8]) -> anyhow::Result<Option<Stored>> {

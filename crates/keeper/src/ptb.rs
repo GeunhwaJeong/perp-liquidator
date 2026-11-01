@@ -9,6 +9,9 @@
 //! by value for the session and hands it back; it has no `store`, so only
 //! `clearing_house::share` can put it back.
 //!
+//! The keeper also cancels, as their executor, the stop tickets left without the position they
+//! were meant for (`stop_orders::cancel_stop_order_ticket`).
+//!
 //! A TWAP ticket takes one transaction per chunk, `twap_orders::execute` with the details made on
 //! chain by `twap_orders::new_details`, and one more at the end: `finalize` once its whole size is
 //! processed, or `cancel` once the engine no longer runs it. Each hands the keeper gas: the share
@@ -322,6 +325,27 @@ impl<'a> Builder<'a> {
             self.engine.orders_package,
             "twap_orders",
             "cancel",
+            vec![self.engine.collateral.clone()],
+            args,
+        );
+        self.keep_gas(gas);
+        self
+    }
+
+    /// Cancels a stop ticket as its executor, which needs no details: the ticket is deleted and
+    /// its gas goes to the keeper.
+    pub fn cancel_stop(&mut self, ticket: &Ticket) -> &mut Self {
+        let executor = self.executor();
+        let args = vec![
+            self.obj(ticket.account),
+            self.obj(self.engine.registry),
+            self.tx.pure(&ticket.id),
+            executor,
+        ];
+        let gas = self.call(
+            self.engine.orders_package,
+            "stop_orders",
+            "cancel_stop_order_ticket",
             vec![self.engine.collateral.clone()],
             args,
         );
@@ -960,6 +984,36 @@ mod tests {
             ticket().id.as_bytes().to_vec()
         );
         assert_eq!(call.arguments[7], Arg::Result(0));
+        let Command::MergeCoins(merge) = &ptb.commands[index + 1] else {
+            panic!("a merge after the cancellation")
+        };
+        assert_eq!(merge.coins_to_merge, vec![Arg::Result(index as u16)]);
+    }
+
+    #[test]
+    fn cancelling_a_stop_ticket_hands_the_keeper_its_gas() {
+        let engine = engine();
+        let mut b = Builder::new(&engine, &offline);
+        b.cancel_stop(&ticket());
+        assert_eq!(
+            b.commands(),
+            "0:clearing_house::no_domain_executor 1:stop_orders::cancel_stop_order_ticket 2:MergeCoins"
+        );
+        let ptb = build(b);
+        assert_eq!(
+            names(&ptb)[1],
+            "stop_orders::cancel_stop_order_ticket<0x7f::tusd::TUSD>"
+        );
+        let (index, call) = stop_call(&ptb);
+        assert_eq!(call.package, engine.orders_package);
+        assert_eq!(call.arguments.len(), 4);
+        assert_eq!(object_of(&ptb, &call.arguments[0]), ticket().account);
+        assert_eq!(object_of(&ptb, &call.arguments[1]), engine.registry);
+        assert_eq!(
+            pure_of(&ptb, &call.arguments[2]),
+            ticket().id.as_bytes().to_vec()
+        );
+        assert_eq!(call.arguments[3], Arg::Result(0));
         let Command::MergeCoins(merge) = &ptb.commands[index + 1] else {
             panic!("a merge after the cancellation")
         };

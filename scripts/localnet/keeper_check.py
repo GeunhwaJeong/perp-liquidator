@@ -22,14 +22,16 @@ encoding of the details. Then:
 3. a take profit on the short, on the book price, fires once the maker's ladder moves below it;
 4. a standalone stop on the mark price places its resting limit order;
 5. a stop loss without a position, an expired ticket, a ticket without details and one naming
-   another executor are left alone, each counted for what it is;
+   another executor are left alone, each counted for what it is, until the stop loss has gone
+   --cancel-orphans-after-secs without a position and the keeper cancels it;
 6. a market order the book is too thin for is retried by simulation alone, backed off, and
    costs no gas;
 7. a market order whose fill strays beyond --max-slippage-bps from the index price is held back
    and alerted on;
 8. TWAP tickets: one buying in three chunks runs each chunk once the gap since the last one has
-   passed and is finalized; a reduce-only one without a position to reduce and one without
-   details are left alone; an expired one and one past its first-run deadline are cancelled; one
+   passed and is finalized; a reduce-only one without a position to reduce is left alone until
+   the keeper cancels it, one without details is left alone; an expired one and one past its
+   first-run deadline are cancelled; one
    that fills nothing spoils after its retry window and is cancelled; a reduce-only one closes the
    long it opened. The net gas of each kind of TWAP transaction is printed;
 9. with the market on a signed source whose price goes stale after ten seconds and nothing
@@ -61,6 +63,8 @@ ORACLE_PORT = 18790
 DETAILS_DB = "sigma_keeper_localnet"
 # What the front end puts in every ticket: the registry's minimum.
 TICKET_GAS = 1_000_000
+# How long a ticket may go without the position it reduces before the keeper cancels it.
+ORPHAN_SECS = 15
 
 
 def load_lib(perp_dex):
@@ -440,6 +444,7 @@ def main():
         "--deployment", str(keeper_deployment), "--rpc-url", f"http://{args.grpc}", "--chain-id", chain_id,
         "--key-file", str(keystore), "--address", keeper,
         "--poll-interval-ms", "500", "--match-interval-secs", "1", "--min-gas-balance", "1",
+        "--cancel-orphans-after-secs", str(ORPHAN_SECS),
     ]
     procs = []
 
@@ -585,8 +590,12 @@ def main():
         still_open = [ticket_status(x) for x in (ticket_d, ticket_e, ticket_g, ticket_f)]
         executed_after = executions("stop_loss_take_profit", "executed") + executions("standalone_stop", "executed")
         check("none of them is executed", still_open == ["open"] * 4 and executed_after == executed_before, str(still_open))
-        # D would fire once W holds a long, as a ticket left over from a closed position does.
-        for left in (ticket_d, ticket_e, ticket_g, ticket_f):
+        # Left in place, D would fire once W holds a long.
+        orphaned = wait_status(ticket_d, "deleted", ORPHAN_SECS + 30)
+        check(f"D, still without a position after {ORPHAN_SECS} s, is cancelled by the keeper", orphaned is not None, log_of("live")[-800:])
+        check("counted as a stop cancellation", executions("stop_cancel", "executed") == 1)
+        check("E, G and F stay open", [ticket_status(x) for x in (ticket_e, ticket_g, ticket_f)] == ["open"] * 3)
+        for left in (ticket_e, ticket_g, ticket_f):
             cancel_ticket("W", left)
 
         # -------------------------------------------------------------- 6. too thin a book
@@ -650,9 +659,13 @@ def main():
         time.sleep(3)
         check("neither runs", [ticket_status(ticket_l), ticket_status(ticket_m)] == ["open", "open"]
               and executions("twap_chunk", "executed") == 3, str(tickets()))
-        user_cancel_twap("W", ticket_l)
+        orphaned = wait_status(ticket_l, "canceled", ORPHAN_SECS + 30)
+        check(f"L, still without a position it reduces after {ORPHAN_SECS} s, is cancelled by the keeper", orphaned is not None,
+              log_of("live")[-800:])
+        check("M stays open", ticket_status(ticket_m) == "open")
         user_cancel_twap("W", ticket_m)
 
+        cancels_before = executions("twap_cancel", "executed")
         now_ms = int(time.time() * 1000)
         ticket_n = twap_ticket("N: a TWAP that expired 15 s ago", "W", twap(side=BID, size=TENTH, chunks=1, gap_ms=0, expire=now_ms - 15_000))
         ticket_o = twap_ticket("O: a TWAP whose first chunk was due by 15 s ago", "W",
@@ -660,7 +673,7 @@ def main():
         both = wait_for(lambda: ticket_status(ticket_n) == "canceled" and ticket_status(ticket_o) == "canceled", 40)
         check("both cancelled by the keeper: the engine no longer runs them", both is not None, log_of("live")[-800:])
         check("counted as cancellations, with no chunk run",
-              executions("twap_cancel", "executed") == 2 and executions("twap_chunk", "executed") == 3,
+              executions("twap_cancel", "executed") == cancels_before + 2 and executions("twap_chunk", "executed") == 3,
               f"{executions('twap_cancel', 'executed')} cancelled, {executions('twap_chunk', 'executed')} chunks")
 
         clear_book()

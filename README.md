@@ -243,10 +243,16 @@ matches its own commitment.
 Handing in details needs no signature: anything but a ticket's true details is stored under a
 commitment no ticket holds. Every `--match-interval-secs` the keeper looks the waiting
 commitments up in the indexer's `order_tickets`, marks the ones a ticket holds and drops the
-others after `--unmatched-ttl-secs` (a day); new details are refused while `--max-unmatched`
-wait. The details live in a database of the keeper's own (`--details-database-url`; the table is
-created at startup), apart from the indexer's, which can be dropped and rebuilt from the chain:
-nowhere else has them.
+others after `--unmatched-ttl-secs` (10 minutes). Nothing is refused for room: past
+`--max-unmatched-per-source` (20) waiting details from one client its own oldest are pushed out,
+past `--max-unmatched` (10,000) the oldest of all, so a flood of made-up details cannot shut the
+door on real ones (`perp_keeper_details_evicted_total` counts them). The client is the peer, or
+the last `X-Forwarded-For` address when the peer is the site's reverse proxy on this host. The
+front end hands the details in again once the ticket is on chain: details a ticket already
+holds are stored matched at once, whatever waits, and the answer says so (`"held": true`). The
+details live in a database of the keeper's own (`--details-database-url`; the table is created,
+and brought up to date, at startup), apart from the indexer's, which can be dropped and rebuilt
+from the chain: nowhere else has them.
 
 ```bash
 target/release/perp-keeper \
@@ -277,6 +283,13 @@ execution whose simulated fill strays from the index price by more than `--max-s
 (10%) is held back and alerted on. Tickets the engine would never take are left alone and counted
 on `/status` and `/metrics`: a stop loss / take profit without a position on its side, an expired
 ticket, a ticket whose details the keeper never got.
+
+A stop loss / take profit or a reduce-only stop that has gone `--cancel-orphans-after-secs`
+(2 minutes) without a position it reduces is cancelled as its executor
+(`stop_orders::cancel_stop_order_ticket`, its gas to the keeper), and so is a reduce-only TWAP
+that cannot run for the same reason. Left in place, such a ticket would act on the next position
+the account opens on that side, which it was never meant for: a liquidated long's stop loss would
+close the next long. The wait covers a position the indexer has not seen yet.
 
 ```bash
 target/release/perp-keeper \
@@ -313,17 +326,20 @@ side reduces, a ticket whose details the keeper never got, details the engine ne
 market (`twap_invalid`), and a ticket whose first chunk keeps failing, which cannot spoil and is
 left to its owner.
 
-`scripts/localnet/keeper_smoke.py` checks the details path alone, against two scratch databases.
-`scripts/localnet/keeper_check.py` runs the keeper on the same held stack as `check.py` (a fresh
-one: it switches the market to a signed source) and checks, in ten phases: startup checks, a stop
-loss / take profit on the index price (waiting, simulated in a dry run, executed live), a take
-profit on the book price, a standalone stop on the mark price, the tickets it leaves alone, a market
-order the book is too thin for (retried by simulation, no gas spent), a fill too far from the index
-price (held back), TWAP tickets (chunks on their gaps and finalized, left alone, cancelled once
-expired, past their first-run deadline or spoiled, a reduce-only one closing the long, with the net
-gas of each kind of transaction printed), a stop only the oracle service's newer price triggers
-(executed with the signed prices relayed in front of it) and shutdown. Every ticket in it commits to
-what the keeper answers for its details, so each execution is also the engine checking the keeper's
-encoding. The front end's side of the same path, `tickets.ts` and the transaction builders, is
-checked by perp-web's `scripts/haneul-localnet/keeper.ts` on its localnet fixture, with the keeper
-running on its key (`fixture.mjs keeper`), the fixture's deployment file and price service.
+`scripts/localnet/keeper_smoke.py` checks the details path alone, against two scratch databases: the
+test vectors, the refusals, the pushing out per client and overall, details a ticket on chain holds
+kept at once, matching and dropping. `scripts/localnet/keeper_check.py` runs the keeper on the same
+held stack as `check.py` (a fresh one: it switches the market to a signed source) and checks, in ten
+phases: startup checks, a stop loss / take profit on the index price (waiting, simulated in a dry
+run, executed live), a take profit on the book price, a standalone stop on the mark price, the
+tickets it leaves alone and the stop loss it cancels for having no position, a market order the book
+is too thin for (retried by simulation, no gas spent), a fill too far from the index price (held
+back), TWAP tickets (chunks on their gaps and finalized, left alone or cancelled for having no
+position, cancelled once expired, past their first-run deadline or spoiled, a reduce-only one
+closing the long, with the net gas of each kind of transaction printed), a stop only the oracle
+service's newer price triggers (executed with the signed prices relayed in front of it) and
+shutdown. Every ticket in it commits to what the keeper answers for its details, so each execution
+is also the engine checking the keeper's encoding. The front end's side of the same path,
+`tickets.ts` and the transaction builders, is checked by perp-web's
+`scripts/haneul-localnet/keeper.ts` on its localnet fixture, with the keeper running on its key
+(`fixture.mjs keeper`), the fixture's deployment file and price service.

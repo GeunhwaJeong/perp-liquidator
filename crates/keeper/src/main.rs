@@ -21,7 +21,7 @@ use perp_keeper::now_ms;
 use perp_keeper::server::{App, router};
 use perp_keeper::setup;
 use perp_keeper::status::{Board, Status};
-use perp_keeper::store::{Indexer, Store};
+use perp_keeper::store::{Indexer, Limits, Store};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -95,7 +95,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let matcher = tokio::spawn(matcher::run(
         store.clone(),
-        indexer,
+        indexer.clone(),
         Duration::from_secs(args.unmatched_ttl_secs),
         args.match_interval(),
         cancel.clone(),
@@ -110,13 +110,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     let app = App {
         store,
-        max_unmatched: args.max_unmatched,
+        indexer,
+        limits: Limits {
+            max_unmatched: args.max_unmatched,
+            max_per_source: args.max_unmatched_per_source,
+        },
         board,
         metrics,
     };
     let server = {
         let cancel = cancel.clone();
-        let app = router(app, args.max_body_bytes);
+        let app = router(app, args.max_body_bytes)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move { cancel.cancelled().await })
@@ -202,6 +207,8 @@ async fn executor(
             alert_after: args.alert_after,
             max_gas_budget: args.max_gas_budget,
             min_gas_balance: args.min_gas_balance,
+            cancel_orphans_after: (args.cancel_orphans_after_secs > 0)
+                .then(|| Duration::from_secs(args.cancel_orphans_after_secs)),
         },
         chain,
         key,

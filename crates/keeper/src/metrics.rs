@@ -12,12 +12,13 @@ pub struct Metrics {
     pub rounds: IntCounter,
     /// Open tickets that name the keeper, by state as of the last round: triggered, waiting,
     /// expired, no_position, mark_unavailable, invalid, no_details, unreadable, unknown_market,
-    /// market_paused, no_price, backoff, just_executed; for TWAP tickets, prefixed with `twap_`:
-    /// due, scheduled, complete, lapsing, expired, first_run_expired, spoiled, invalid and the
-    /// shared ones.
+    /// market_paused, no_price, backoff, just_executed, orphaned (cancelled for having gone too
+    /// long without a position it reduces); for TWAP tickets, prefixed with `twap_`: due,
+    /// scheduled, complete, lapsing, expired, first_run_expired, spoiled, invalid and the shared
+    /// ones.
     pub tickets: IntGaugeVec,
-    /// Transactions by kind (stop_loss_take_profit, standalone_stop, twap_chunk, twap_finalize,
-    /// twap_cancel) and result: executed, simulated (dry run), refused (would abort or failed to
+    /// Transactions by kind (stop_loss_take_profit, standalone_stop, stop_cancel, twap_chunk,
+    /// twap_finalize, twap_cancel) and result: executed, simulated (dry run), refused (would abort or failed to
     /// build), guarded (the fill strayed from the index), rejected, unknown, failed (landed and
     /// failed).
     pub executions: IntCounterVec,
@@ -30,6 +31,10 @@ pub struct Metrics {
     pub gas_rebated: IntCounter,
     pub gas_balance: Gauge,
     pub alerts: IntCounterVec,
+    /// Waiting details pushed out by newer ones, by why: `source` (the client's own oldest,
+    /// over `--max-unmatched-per-source`) or `capacity` (the oldest of all, over
+    /// `--max-unmatched`). A climb means someone floods the endpoint.
+    pub details_evicted: IntCounterVec,
 }
 
 fn opts(name: &str, help: &str) -> Opts {
@@ -94,6 +99,16 @@ impl Metrics {
             alerts: register!(
                 registry,
                 IntCounterVec::new(opts("alerts_total", "Alerts raised, by level"), &["level"])
+            ),
+            details_evicted: register!(
+                registry,
+                IntCounterVec::new(
+                    opts(
+                        "details_evicted_total",
+                        "Waiting details pushed out by newer ones, by why"
+                    ),
+                    &["reason"]
+                )
             ),
             registry,
         })

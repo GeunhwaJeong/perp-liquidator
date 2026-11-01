@@ -6,9 +6,11 @@
 //! (`trigger`, `schedule`); and sends one transaction for each ticket that needs one: first the
 //! stops whose trigger price has crossed, stop losses first and larger orders before smaller
 //! ones, then the TWAP tickets, oldest first: the chunks that are due, the finalizations and the
-//! cancellations. The full node simulates every transaction before it is signed, so one the
-//! engine would refuse costs nothing; a ticket that keeps failing is tried less and less often,
-//! until it no longer needs a transaction.
+//! cancellations; last the tickets left without the position they reduce for longer than
+//! `--cancel-orphans-after-secs`, which it cancels before they act on a position they were not
+//! meant for. The full node simulates every transaction before it is signed, so one the engine
+//! would refuse costs nothing; a ticket that keeps failing is tried less and less often, until
+//! it no longer needs a transaction.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
@@ -64,6 +66,8 @@ pub struct Settings {
     pub alert_after: u32,
     pub max_gas_budget: u64,
     pub min_gas_balance: f64,
+    /// How long a ticket may go without the position it reduces before it is cancelled.
+    pub cancel_orphans_after: Option<Duration>,
 }
 
 pub struct Parts {
@@ -182,6 +186,9 @@ enum Job {
         /// The last attempt the indexer had seen, to tell when it has seen this one.
         last_attempt_ms: u64,
     },
+    /// A stop loss / take profit, a reduce-only stop or a reduce-only TWAP that has gone without
+    /// a position it reduces for too long, cancelled as its executor.
+    Orphan { twap: bool },
 }
 
 impl Job {
@@ -196,7 +203,8 @@ impl Job {
                 plan: Plan::Complete,
                 ..
             } => "twap_finalize",
-            Self::Twap { .. } => "twap_cancel",
+            Self::Twap { .. } | Self::Orphan { twap: true } => "twap_cancel",
+            Self::Orphan { twap: false } => "stop_cancel",
         }
     }
 
@@ -209,6 +217,7 @@ impl Job {
                 ..
             } => format!("amount={amount}"),
             Self::Twap { plan, .. } => plan.state().to_owned(),
+            Self::Orphan { .. } => "orphaned".to_owned(),
         }
     }
 
@@ -241,6 +250,8 @@ pub struct Executor {
     /// TWAP tickets whose chunk was sent, with the last attempt the indexer had seen then: left
     /// alone until the indexer reports another one.
     just_ran: HashMap<String, (Instant, u64)>,
+    /// When each ticket was first seen without a position it reduces.
+    no_position_since: HashMap<String, Instant>,
     gas_price: Option<(u64, Instant)>,
     gas_checked: Option<Instant>,
 }
@@ -254,6 +265,7 @@ impl Executor {
             failures: HashMap::new(),
             just_executed: HashMap::new(),
             just_ran: HashMap::new(),
+            no_position_since: HashMap::new(),
             gas_price: None,
             gas_checked: None,
         }
@@ -336,6 +348,8 @@ impl Executor {
             .retain(|id, at| open.contains(id.as_str()) && at.elapsed() < JUST_EXECUTED_FOR);
         self.just_ran
             .retain(|id, (at, _)| open.contains(id.as_str()) && at.elapsed() < JUST_EXECUTED_FOR);
+        self.no_position_since
+            .retain(|id, _| open.contains(id.as_str()));
         for twap in &twaps {
             let seen = twap.last_attempt_ms.unwrap_or(0).max(0) as u64;
             if self
@@ -414,17 +428,23 @@ impl Executor {
             .collect();
 
         let mut candidates = Vec::new();
+        let mut orphans = Vec::new();
         for ticket in &tickets {
             let state = match self.assess(ticket, &details, &priced, &paused, &positions, now) {
+                Ok(candidate) if matches!(candidate.job, Job::Orphan { .. }) => {
+                    orphans.push(candidate);
+                    "orphaned"
+                }
                 Ok(candidate) => {
                     candidates.push(candidate);
                     "triggered"
                 }
                 Err(state) => state,
             };
+            self.track_position(&ticket.ticket_id, state);
             // A ticket that stopped triggering starts afresh when it triggers again: a stop
             // must not wait out the backoff of a failure long past.
-            if state != "triggered" && state != "backoff" {
+            if !matches!(state, "triggered" | "orphaned" | "backoff") {
                 self.failures.remove(&ticket.ticket_id);
             }
             *states.entry(state.to_owned()).or_default() += 1;
@@ -448,25 +468,94 @@ impl Executor {
         for twap in &twaps {
             let state =
                 match self.assess_twap(twap, &details, &priced, &paused, &lots, &positions, now) {
+                    Ok(candidate) if matches!(candidate.job, Job::Orphan { .. }) => {
+                        orphans.push(candidate);
+                        "orphaned"
+                    }
                     Ok(candidate) => {
                         let state = match &candidate.job {
                             Job::Twap { plan, .. } => plan.state(),
-                            Job::Stop { .. } => "triggered",
+                            _ => "triggered",
                         };
                         candidates.push(candidate);
                         state
                     }
                     Err(state) => state,
                 };
+            self.track_position(&twap.ticket_id, state);
             if !matches!(
                 state,
-                "due" | "complete" | "expired" | "first_run_expired" | "spoiled" | "backoff"
+                "due"
+                    | "complete"
+                    | "expired"
+                    | "first_run_expired"
+                    | "spoiled"
+                    | "orphaned"
+                    | "backoff"
             ) {
                 self.failures.remove(&twap.ticket_id);
             }
             *states.entry(format!("twap_{state}")).or_default() += 1;
         }
+        candidates.extend(orphans);
         Ok(candidates)
+    }
+
+    /// Starts the clock on a ticket seen without a position it reduces, and stops it once the
+    /// ticket is seen otherwise; a backoff leaves it running.
+    fn track_position(&mut self, ticket_id: &str, state: &str) {
+        match state {
+            "no_position" | "orphaned" => {
+                self.no_position_since
+                    .entry(ticket_id.to_owned())
+                    .or_insert_with(Instant::now);
+            }
+            "backoff" => {}
+            _ => {
+                self.no_position_since.remove(ticket_id);
+            }
+        }
+    }
+
+    /// Whether a ticket has gone without a position it reduces for long enough to be cancelled.
+    fn orphaned(&self, ticket_id: &str) -> bool {
+        match (
+            self.p.settings.cancel_orphans_after,
+            self.no_position_since.get(ticket_id),
+        ) {
+            (Some(after), Some(since)) => since.elapsed() >= after,
+            _ => false,
+        }
+    }
+
+    fn orphan(
+        &self,
+        ticket_id: &str,
+        account: &str,
+        account_id: i64,
+        market: usize,
+        relay: Option<(Relay, Vec<SignedUpdate>)>,
+        twap: bool,
+    ) -> Result<Candidate, &'static str> {
+        if self
+            .failures
+            .get(ticket_id)
+            .is_some_and(|f| f.until > Instant::now())
+        {
+            return Err("backoff");
+        }
+        let (Ok(id), Ok(account)) = (Address::from_str(ticket_id), Address::from_str(account))
+        else {
+            return Err("unreadable");
+        };
+        Ok(Candidate {
+            ticket_id: ticket_id.to_owned(),
+            ticket: Ticket { id, account },
+            account_id: account_id.max(0) as u64,
+            market,
+            relay,
+            job: Job::Orphan { twap },
+        })
     }
 
     /// A ticket ready to execute, or the state that keeps it from executing.
@@ -522,8 +611,20 @@ impl Executor {
             }
             Revealed::StandaloneStop(d) => trigger::standalone_stop(d, &priced.prices, base, now),
         };
-        let Verdict::Triggered { stop_loss } = verdict else {
-            return Err(state(verdict));
+        let stop_loss = match verdict {
+            Verdict::Triggered { stop_loss } => stop_loss,
+            // Cancelling a stop ticket needs no price.
+            Verdict::NoPosition if self.orphaned(&ticket.ticket_id) => {
+                return self.orphan(
+                    &ticket.ticket_id,
+                    &ticket.account,
+                    ticket.account_id,
+                    index,
+                    None,
+                    false,
+                );
+            }
+            other => return Err(state(other)),
         };
         if self
             .failures
@@ -621,6 +722,17 @@ impl Executor {
                 base.is_negative()
             };
             if !reduces {
+                // Cancelling a partly run TWAP releases collateral, which reads the prices.
+                if self.orphaned(&twap.ticket_id) {
+                    return self.orphan(
+                        &twap.ticket_id,
+                        &twap.account,
+                        twap.account_id,
+                        index,
+                        relay,
+                        true,
+                    );
+                }
                 return Err("no_position");
             }
         }
@@ -669,7 +781,10 @@ impl Executor {
                 plan: Plan::Complete,
                 ..
             } => b.finalize(&c.ticket, clearing_house, details, &feeds),
-            Job::Twap { .. } => b.cancel_twap(&c.ticket, clearing_house, &feeds),
+            Job::Twap { .. } | Job::Orphan { twap: true } => {
+                b.cancel_twap(&c.ticket, clearing_house, &feeds)
+            }
+            Job::Orphan { twap: false } => b.cancel_stop(&c.ticket),
         };
         let commands = b.commands();
         let tx = b.finish();
@@ -1120,6 +1235,9 @@ fn describe(abort: &Abort, commands: &str) -> String {
         ("twap_orders", 6310) => Some("the first chunk's deadline has passed"),
         ("twap_orders", 6311) => Some("the gas price is not the reference gas price"),
         ("twap_orders", 6312) => Some("the size or the chunk is not in lots"),
+        ("account", 4004) => Some(
+            "the account no longer holds the ticket: executed or cancelled since the indexer last saw it",
+        ),
         ("clearing_house", 1) => Some("the order is empty: a reduce-only order with no position"),
         ("clearing_house", 9) => Some("the reduce-only order has no position to reduce"),
         ("clearing_house", 30) => Some("the account lacks the collateral the filled order needs"),
@@ -1269,6 +1387,7 @@ mod tests {
             "the book is too thin to fill the market order: aborts in clearing_house::f with 45 at command 4"
         );
         assert!(describe(&abort("stop_orders", 6202), "").starts_with("the details do not hash"));
+        assert!(describe(&abort("account", 4004), "").starts_with("the account no longer holds"));
         assert_eq!(
             describe(&abort("account", 3), "0:a 1:b"),
             "aborts in account::f with 3 at command 4 (0:a 1:b)"
