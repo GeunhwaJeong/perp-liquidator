@@ -284,6 +284,22 @@ execution whose simulated fill strays from the index price by more than `--max-s
 on `/status` and `/metrics`: a stop loss / take profit without a position on its side, an expired
 ticket, a ticket whose details the keeper never got.
 
+A ticket the keeper cannot execute at all never fires, and a gauge tells nobody: its details never
+arrived (`no_details`) or do not read as the ticket's (`unreadable`), it names a market the keeper
+does not run (`unknown_market`), or the engine takes no order of its details (`invalid`). Once a
+ticket has stayed so for `--stuck-alert-after-secs` (2 minutes) the keeper logs it, shows the
+`stuck_tickets` problem on `/status` and raises one alert for all such tickets, again when another
+joins them: anyone can make a ticket that names the keeper, so the alert is not one per ticket. A
+failure to read the tickets or their markets is a warning at first and fails `/health` once it has
+lasted `--reading-critical-after-secs` (1 minute), since nothing is executed meanwhile.
+
+The keeper knows the tickets, the positions and the TWAP progress from the indexer. `/status` and
+`/metrics` show the indexer's checkpoint and how far its clock is behind (`indexer_lag_ms`). While
+that is more than `--max-indexer-lag-secs` (30 s) the keeper raises the `indexer_lag` alert and
+cancels nothing, neither a ticket without its position nor a TWAP that looks expired or spoiled:
+the position may be there and the TWAP may have run. Executions go on, since the engine checks
+each against the chain, and the clocks on tickets without a position start anew afterwards.
+
 A stop loss / take profit or a reduce-only stop that has gone `--cancel-orphans-after-secs`
 (2 minutes) without a position it reduces is cancelled as its executor
 (`stop_orders::cancel_stop_order_ticket`, its gas to the keeper), and so is a reduce-only TWAP
@@ -326,6 +342,12 @@ side reduces, a ticket whose details the keeper never got, details the engine ne
 market (`twap_invalid`), and a ticket whose first chunk keeps failing, which cannot spoil and is
 left to its owner.
 
+The engine takes a TWAP ticket made without any gas and with any number of chunks, and the keeper
+pays each chunk's transaction. It runs no chunk of a ticket made with less gas than
+`--min-twap-gas` (1,000,000, what the front end puts in; `twap_underfunded`) or planning more
+chunks than `--max-twap-chunks` (120, the front end's limit; `twap_too_many_chunks`). Such a
+ticket is left to its owner; 0 switches a limit off.
+
 `scripts/localnet/keeper_smoke.py` checks the details path alone, against two scratch databases: the
 test vectors, the refusals, the pushing out per client and overall, details a ticket on chain holds
 kept at once, matching and dropping. `scripts/localnet/keeper_check.py` runs the keeper on the same
@@ -343,3 +365,11 @@ is also the engine checking the keeper's encoding. The front end's side of the s
 `tickets.ts` and the transaction builders, is checked by perp-web's
 `scripts/haneul-localnet/keeper.ts` on its localnet fixture, with the keeper running on its key
 (`fixture.mjs keeper`), the fixture's deployment file and price service.
+
+`scripts/localnet/keeper_watch.py` checks what the keeper says and holds back, on
+`sltp_thin_book.py`'s stack with an alert webhook of its own: a ticket without its details
+(counted, then a problem on `/status` and one alert, gone once the details arrive), an indexer
+stopped while a position is opened again (without the lag limit the keeper cancels the stop loss
+of a position that is there; with it, an alert and no cancellation), TWAP tickets made with no gas
+or of too many chunks (left alone, the funded one run and finalized), and the indexer's database
+not answering (a warning, then `/health` 503 and an alert, healthy again afterwards).

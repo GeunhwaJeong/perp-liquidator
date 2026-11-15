@@ -21,6 +21,7 @@ pub mod setup;
 pub mod status;
 pub mod store;
 pub mod trigger;
+pub mod watch;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

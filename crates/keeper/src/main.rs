@@ -209,6 +209,12 @@ async fn executor(
             min_gas_balance: args.min_gas_balance,
             cancel_orphans_after: (args.cancel_orphans_after_secs > 0)
                 .then(|| Duration::from_secs(args.cancel_orphans_after_secs)),
+            stuck_alert_after: (args.stuck_alert_after_secs > 0)
+                .then(|| Duration::from_secs(args.stuck_alert_after_secs)),
+            reading_critical_after: Duration::from_secs(args.reading_critical_after_secs),
+            max_indexer_lag: Duration::from_secs(args.max_indexer_lag_secs),
+            min_twap_gas: args.min_twap_gas,
+            max_twap_chunks: args.max_twap_chunks,
         },
         chain,
         key,

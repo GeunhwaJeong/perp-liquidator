@@ -11,6 +11,12 @@
 //! meant for. The full node simulates every transaction before it is signed, so one the engine
 //! would refuse costs nothing; a ticket that keeps failing is tried less and less often, until
 //! it no longer needs a transaction.
+//!
+//! What it knows of the tickets comes from the indexer. While the indexer is further behind the
+//! chain than `--max-indexer-lag-secs`, the keeper says so and cancels nothing: a position it
+//! sees gone may be there, a TWAP it sees stalled may have run. A ticket it cannot execute at
+//! all (its details never arrived, or are not the ticket's) is alerted on after
+//! `--stuck-alert-after-secs`, since its stop will never fire.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
@@ -18,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use bigdecimal::{BigDecimal, Signed, Zero};
+use bigdecimal::{BigDecimal, Signed, ToPrimitive, Zero};
 use haneul_crypto::HaneulSigner;
 use haneul_sdk_types::{Address, Transaction};
 use haneul_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -27,7 +33,7 @@ use perp_bot_common::chain::{Abort, BuildError, Chain, ExecuteError, Outcome};
 use perp_bot_common::deployment::db_id;
 use perp_bot_common::keys::Key;
 use perp_bot_common::oracle::{self, Relay, SignedUpdate, Updates};
-use perp_bot_common::store::{MarketRow, Store as Snapshots};
+use perp_bot_common::store::{MarketRow, Store as Snapshots, Watermark};
 use perp_bot_common::tickets::{StandaloneStop, StopLossTakeProfit, TwapDetails};
 use perp_engine::MarketState;
 use perp_types::perpetuals::Event;
@@ -44,6 +50,7 @@ use crate::setup::{Market, Oracle};
 use crate::status::{Board, LastExecution};
 use crate::store::{Indexer, OpenTicket, OpenTwap, Store};
 use crate::trigger::{self, Prices, Verdict};
+use crate::watch::{self, Stuck};
 
 const HANEUL: &str = "0x2::haneul::HANEUL";
 const HANEUL_UNIT: f64 = 1e9;
@@ -68,6 +75,16 @@ pub struct Settings {
     pub min_gas_balance: f64,
     /// How long a ticket may go without the position it reduces before it is cancelled.
     pub cancel_orphans_after: Option<Duration>,
+    /// How long a ticket may stay unexecutable before it is alerted on.
+    pub stuck_alert_after: Option<Duration>,
+    /// How long reading the tickets may fail before the keeper is unhealthy.
+    pub reading_critical_after: Duration,
+    /// How far behind the chain the indexer may be before cancellations wait for it.
+    pub max_indexer_lag: Duration,
+    /// The least gas a TWAP ticket was made with, and the most chunks it plans, for its chunks
+    /// to be run; 0 is no limit.
+    pub min_twap_gas: u64,
+    pub max_twap_chunks: u64,
 }
 
 pub struct Parts {
@@ -252,6 +269,12 @@ pub struct Executor {
     just_ran: HashMap<String, (Instant, u64)>,
     /// When each ticket was first seen without a position it reduces.
     no_position_since: HashMap<String, Instant>,
+    /// The tickets that cannot be executed as they are, and since when.
+    stuck: Stuck,
+    /// Since when the tickets and their markets could not be read.
+    reading_failed_since: Option<Instant>,
+    /// Whether the indexer is too far behind the chain for what it shows to cancel a ticket.
+    lagging: bool,
     gas_price: Option<(u64, Instant)>,
     gas_checked: Option<Instant>,
 }
@@ -266,6 +289,9 @@ impl Executor {
             just_executed: HashMap::new(),
             just_ran: HashMap::new(),
             no_position_since: HashMap::new(),
+            stuck: Stuck::default(),
+            reading_failed_since: None,
+            lagging: false,
             gas_price: None,
             gas_checked: None,
         }
@@ -290,6 +316,7 @@ impl Executor {
         let mut states = BTreeMap::new();
         match self.candidates(now_ms(), &mut states).await {
             Ok(candidates) => {
+                self.reading_failed_since = None;
                 if self.p.board.clear_problem("reading") {
                     info!("The tickets and their markets can be read again");
                 }
@@ -303,7 +330,25 @@ impl Executor {
             Err(e) => {
                 let message = format!("{e:#}");
                 warn!("{message}");
-                self.p.board.set_problem("reading", Level::Warning, message);
+                // A failure that lasts executes nothing: past the wait it fails `/health`.
+                let since = *self.reading_failed_since.get_or_insert_with(Instant::now);
+                let level = if since.elapsed() >= self.p.settings.reading_critical_after {
+                    Level::Critical
+                } else {
+                    Level::Warning
+                };
+                if self.p.board.set_problem("reading", level, message.clone())
+                    && level == Level::Critical
+                {
+                    self.p.alerts.raise(
+                        level,
+                        "reading",
+                        format!(
+                            "The tickets could not be read for {} s and none is executed: {message}",
+                            since.elapsed().as_secs()
+                        ),
+                    );
+                }
             }
         }
         self.p.metrics.tickets.reset();
@@ -326,6 +371,13 @@ impl Executor {
         now: i64,
         states: &mut BTreeMap<String, u64>,
     ) -> anyhow::Result<Vec<Candidate>> {
+        let watermark = self
+            .p
+            .indexer
+            .watermark()
+            .await
+            .context("Failed to read how far the indexer has come")?;
+        self.observe_indexer(watermark.as_ref(), now);
         let tickets = self
             .p
             .indexer
@@ -350,6 +402,7 @@ impl Executor {
             .retain(|id, (at, _)| open.contains(id.as_str()) && at.elapsed() < JUST_EXECUTED_FOR);
         self.no_position_since
             .retain(|id, _| open.contains(id.as_str()));
+        self.stuck.retain(&open);
         for twap in &twaps {
             let seen = twap.last_attempt_ms.unwrap_or(0).max(0) as u64;
             if self
@@ -361,6 +414,7 @@ impl Executor {
             }
         }
         if tickets.is_empty() && twaps.is_empty() {
+            self.report_stuck();
             return Ok(Vec::new());
         }
 
@@ -442,6 +496,7 @@ impl Executor {
                 Err(state) => state,
             };
             self.track_position(&ticket.ticket_id, state);
+            self.stuck.observe(&ticket.ticket_id, state, Instant::now());
             // A ticket that stopped triggering starts afresh when it triggers again: a stop
             // must not wait out the backoff of a failure long past.
             if !matches!(state, "triggered" | "orphaned" | "backoff") {
@@ -483,6 +538,7 @@ impl Executor {
                     Err(state) => state,
                 };
             self.track_position(&twap.ticket_id, state);
+            self.stuck.observe(&twap.ticket_id, state, Instant::now());
             if !matches!(
                 state,
                 "due"
@@ -498,12 +554,80 @@ impl Executor {
             *states.entry(format!("twap_{state}")).or_default() += 1;
         }
         candidates.extend(orphans);
+        self.report_stuck();
         Ok(candidates)
+    }
+
+    /// Records how far the indexer is behind the chain, and says so once it is too far.
+    fn observe_indexer(&mut self, watermark: Option<&Watermark>, now: i64) {
+        let Some(watermark) = watermark else {
+            self.lagging = false;
+            return;
+        };
+        let lag = watch::lag_ms(now, watermark.timestamp_ms);
+        self.p.metrics.indexer_checkpoint.set(watermark.checkpoint);
+        self.p.metrics.indexer_lag_ms.set(lag);
+        self.p.board.update(|s| {
+            s.indexer_checkpoint = Some(watermark.checkpoint);
+            s.indexer_lag_ms = Some(lag);
+        });
+        self.lagging = lag as u128 > self.p.settings.max_indexer_lag.as_millis();
+        if self.lagging {
+            // No clock runs on positions read from an indexer that is behind.
+            self.no_position_since.clear();
+            let message = format!(
+                "The indexer is {} s behind the chain: tickets made since are not seen, and no \
+                 ticket is cancelled until it catches up",
+                lag / 1000
+            );
+            if self
+                .p
+                .board
+                .set_problem("indexer_lag", Level::Warning, message.clone())
+            {
+                self.p.alerts.raise(Level::Warning, "indexer_lag", message);
+            }
+        } else if self.p.board.clear_problem("indexer_lag") {
+            info!("The indexer has caught up");
+        }
+    }
+
+    /// Says which tickets have been unexecutable for too long: one problem on the board and one
+    /// alert for all of them, raised again when another ticket joins them.
+    fn report_stuck(&mut self) {
+        let Some(after) = self.p.settings.stuck_alert_after else {
+            return;
+        };
+        let overdue = self.stuck.overdue(after, Instant::now());
+        if overdue.all.is_empty() {
+            if self.p.board.clear_problem("stuck_tickets") {
+                info!("No open ticket is unexecutable any more");
+            }
+            return;
+        }
+        for (ticket, state) in &overdue.new {
+            warn!(
+                ticket,
+                state, "The ticket cannot be executed and will not fire as it is"
+            );
+        }
+        let message = watch::describe(&overdue.all, after);
+        self.p
+            .board
+            .set_problem("stuck_tickets", Level::Warning, message.clone());
+        if !overdue.new.is_empty() {
+            self.p
+                .alerts
+                .raise(Level::Warning, "stuck_tickets", message);
+        }
     }
 
     /// Starts the clock on a ticket seen without a position it reduces, and stops it once the
     /// ticket is seen otherwise; a backoff leaves it running.
     fn track_position(&mut self, ticket_id: &str, state: &str) {
+        if self.lagging {
+            return;
+        }
         match state {
             "no_position" | "orphaned" => {
                 self.no_position_since
@@ -697,6 +821,20 @@ impl Executor {
         let runs = matches!(plan, Plan::Run { .. });
         if !runs && plan != Plan::Complete && !plan.cancels() {
             return Err(plan.state());
+        }
+        // A cancellation rests on the progress the indexer last saw.
+        if plan.cancels() && self.lagging {
+            return Err("indexer_lag");
+        }
+        if runs
+            && let Some(refusal) = watch::twap_refusal(
+                twap.gas.to_u64().unwrap_or(0),
+                revealed.chunks_amount,
+                self.p.settings.min_twap_gas,
+                self.p.settings.max_twap_chunks,
+            )
+        {
+            return Err(refusal);
         }
         // A chunk needs the market running and a price to relay; finalizing and cancelling
         // release collateral only while the market runs, and need no price while it is paused.

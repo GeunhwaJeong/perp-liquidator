@@ -30,6 +30,10 @@ pub struct Status {
     pub executions: u64,
     /// Open tickets that name the keeper, by state, as of the last round.
     pub tickets: BTreeMap<String, u64>,
+    /// The checkpoint the indexer has reached, and how far its clock is behind the keeper's, as
+    /// of the last round.
+    pub indexer_checkpoint: Option<i64>,
+    pub indexer_lag_ms: Option<i64>,
     pub last_execution: Option<LastExecution>,
     pub problems: BTreeMap<String, Problem>,
 }

@@ -109,6 +109,31 @@ pub struct Args {
     /// yet.
     #[clap(long, default_value_t = 120)]
     pub cancel_orphans_after_secs: u64,
+    /// How long a ticket may stay in a state the keeper cannot execute it from before an alert
+    /// is raised, in seconds; 0 never alerts. These are the states a ticket does not leave by
+    /// itself: its details never arrived (`no_details`) or do not read as the ticket's
+    /// (`unreadable`), it names a market the keeper does not run (`unknown_market`), or the
+    /// engine takes no order of its details (`invalid`). A stop in such a state never fires.
+    #[clap(long, default_value_t = 120)]
+    pub stuck_alert_after_secs: u64,
+    /// How long the tickets and their markets may fail to be read before `/health` fails, in
+    /// seconds. Until then the failure is a warning on `/status`.
+    #[clap(long, default_value_t = 60)]
+    pub reading_critical_after_secs: u64,
+    /// How far behind the chain the indexer may be before the keeper raises an alert and stops
+    /// cancelling tickets, in seconds. The keeper learns of tickets, positions and TWAP progress
+    /// from the indexer: behind, it may take a position for gone that is there, or a TWAP for
+    /// stalled that ran. Executions go on, since the engine checks each against the chain.
+    #[clap(long, default_value_t = 30)]
+    pub max_indexer_lag_secs: u64,
+    /// The least gas a TWAP ticket must have been made with for the keeper to run its chunks,
+    /// in the smallest unit of HANEUL; 0 runs any. The engine takes a TWAP ticket without gas,
+    /// and the keeper pays each chunk's transaction.
+    #[clap(long, default_value_t = 1_000_000)]
+    pub min_twap_gas: u64,
+    /// The most chunks a TWAP ticket may plan for the keeper to run it; 0 runs any.
+    #[clap(long, default_value_t = 120)]
+    pub max_twap_chunks: u64,
 
     /// Sign nothing whose gas budget is above this, in the smallest unit of HANEUL.
     #[clap(long, default_value_t = 500_000_000)]

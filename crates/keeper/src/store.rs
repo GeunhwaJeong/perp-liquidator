@@ -15,6 +15,7 @@ use diesel::sql_types::{Array, BigInt, Binary, Nullable, Numeric, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use perp_bot_common::store::Watermark;
 use url::Url;
 
 const SCHEMA: [&str; 4] = [
@@ -118,6 +119,9 @@ pub struct OpenTwap {
     pub market: String,
     #[diesel(sql_type = Binary)]
     pub commitment: Vec<u8>,
+    /// The gas the ticket was made with, in the smallest unit of HANEUL.
+    #[diesel(sql_type = Numeric)]
+    pub gas: BigDecimal,
     /// From the last `ProcessedTWAPOrderTicket`; `None` before the first attempt.
     #[diesel(sql_type = Nullable<BigInt>)]
     pub processed_amount: Option<i64>,
@@ -336,6 +340,19 @@ impl Indexer {
         })
     }
 
+    /// How far the indexer has followed the chain; `None` before it has indexed anything.
+    pub async fn watermark(&self) -> anyhow::Result<Option<Watermark>> {
+        let mut conn = self.pool.get().await.context("No database connection")?;
+        Ok(sql_query(
+            "SELECT checkpoint_hi_inclusive AS checkpoint, \
+                    timestamp_ms_hi_inclusive AS timestamp_ms \
+             FROM watermarks WHERE pipeline = 'state'",
+        )
+        .get_results::<Watermark>(&mut conn)
+        .await?
+        .pop())
+    }
+
     /// Of `commitments`, the ones a ticket holds. The indexer keeps a ticket's row, with its
     /// latest commitment, after the ticket is executed or deleted.
     pub async fn held(&self, commitments: &[Vec<u8>]) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -373,7 +390,7 @@ impl Indexer {
         let mut conn = self.pool.get().await.context("No database connection")?;
         Ok(sql_query(
             "SELECT t.ticket_id, t.account_id, a.object_id AS account, t.market, \
-                    t.encrypted_details AS commitment, \
+                    t.encrypted_details AS commitment, t.gas, \
                     (t.twap_progress->>'processed_amount')::BIGINT AS processed_amount, \
                     (t.twap_progress->>'scheduled_amount')::BIGINT AS scheduled_amount, \
                     (t.twap_progress->>'last_attempt_timestamp_ms')::BIGINT AS last_attempt_ms, \

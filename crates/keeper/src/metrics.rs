@@ -4,7 +4,7 @@
 //! The keeper's metrics, served on `/metrics`.
 
 use prometheus::{
-    Encoder, Gauge, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 pub struct Metrics {
@@ -14,9 +14,14 @@ pub struct Metrics {
     /// expired, no_position, mark_unavailable, invalid, no_details, unreadable, unknown_market,
     /// market_paused, no_price, backoff, just_executed, orphaned (cancelled for having gone too
     /// long without a position it reduces); for TWAP tickets, prefixed with `twap_`: due,
-    /// scheduled, complete, lapsing, expired, first_run_expired, spoiled, invalid and the shared
-    /// ones.
+    /// scheduled, complete, lapsing, expired, first_run_expired, spoiled, invalid, underfunded
+    /// (made with less gas than `--min-twap-gas`), too_many_chunks (more than
+    /// `--max-twap-chunks`), indexer_lag (a cancellation that waits for the indexer) and the
+    /// shared ones.
     pub tickets: IntGaugeVec,
+    /// The checkpoint the indexer has reached, and how far its clock is behind the keeper's.
+    pub indexer_checkpoint: IntGauge,
+    pub indexer_lag_ms: IntGauge,
     /// Transactions by kind (stop_loss_take_profit, standalone_stop, stop_cancel, twap_chunk,
     /// twap_finalize, twap_cancel) and result: executed, simulated (dry run), refused (would abort or failed to
     /// build), guarded (the fill strayed from the index), rejected, unknown, failed (landed and
@@ -63,6 +68,20 @@ impl Metrics {
                     opts("tickets", "Open tickets that name the keeper, by state"),
                     &["state"]
                 )
+            ),
+            indexer_checkpoint: register!(
+                registry,
+                IntGauge::with_opts(opts(
+                    "indexer_checkpoint",
+                    "The checkpoint the indexer has reached"
+                ))
+            ),
+            indexer_lag_ms: register!(
+                registry,
+                IntGauge::with_opts(opts(
+                    "indexer_lag_ms",
+                    "How far the indexer's clock is behind the keeper's, in milliseconds"
+                ))
             ),
             executions: register!(
                 registry,
