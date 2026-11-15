@@ -160,6 +160,24 @@ class Check(md.Run):
         if not ok:
             self.failed.append(what)
 
+    def ptb(self, label, cmds, sender=None, may_abort=False):
+        """mark_drag's transaction, tried again while the price on chain is stale.
+
+        These transactions carry no signed prices: a session reads what the fixture's relay last
+        wrote, and the engine refuses a price older than the market's tolerance, ten seconds. A
+        round of the relay fails when a mint has taken the admin's gas coin from under it, so the
+        price can be that old for a few rounds.
+        """
+        j, text = None, ""
+        for _ in range(10):
+            j, text = super().ptb(label, cmds, sender=sender, may_abort=True)
+            if j is not None or "oracle_price" not in text:
+                break
+            time.sleep(3)
+        if j is None and not may_abort:
+            sys.exit(f"{label} failed:\n{text[-1500:]}")
+        return j, text
+
     # ------------------------------------------------------------ the wallet, through the front end
 
     def app(self, mode, key, *args):
