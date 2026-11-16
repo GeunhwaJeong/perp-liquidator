@@ -15,10 +15,11 @@ use perp_bot_common::keys;
 use perp_bot_common::store::Store as Snapshots;
 use perp_keeper::config::Args;
 use perp_keeper::executor::{Executor, Parts, Settings};
+use perp_keeper::intake::{self, Door};
 use perp_keeper::matcher;
 use perp_keeper::metrics::Metrics;
 use perp_keeper::now_ms;
-use perp_keeper::server::{App, router};
+use perp_keeper::server::{self, App, router};
 use perp_keeper::setup;
 use perp_keeper::status::{Board, Status};
 use perp_keeper::store::{Indexer, Limits, Store};
@@ -54,6 +55,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     args.validate()?;
     let store = Store::connect(&args.details_database_url, args.pool_size).await?;
     let indexer = Indexer::connect(&args.database_url, args.pool_size).await?;
+    // The intake's own connections. Whatever is handed in, and however much of it, holds
+    // none of the connections the tickets are read and executed with.
+    let intake_store =
+        Store::connect_only(&args.details_database_url, args.intake_pool_size).await?;
+    let intake_indexer = Indexer::connect(&args.database_url, args.intake_pool_size).await?;
     let metrics = Arc::new(Metrics::new()?);
     let mode = match (args.executes(), args.dry_run) {
         (false, _) => "details-only",
@@ -71,22 +77,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .then(|| (args.poll_interval() * 30).max(Duration::from_secs(60))),
     ));
 
-    let executor = if args.executes() {
-        Some(
-            executor(
-                &args,
-                store.clone(),
-                indexer.clone(),
-                metrics.clone(),
-                board.clone(),
-            )
-            .await?,
+    let (executor, alerts) = if args.executes() {
+        let (executor, alerts) = executor(
+            &args,
+            store.clone(),
+            indexer.clone(),
+            metrics.clone(),
+            board.clone(),
         )
+        .await?;
+        (Some(executor), alerts)
     } else {
         info!(
             "Taking details in only: without --deployment, --rpc-url and --key-file no ticket is executed"
         );
-        None
+        (None, alerts(&args, &metrics, "perp-keeper".to_owned())?)
     };
     if args.check_only {
         return Ok(());
@@ -109,15 +114,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
         "Serving POST /v1/details, /health, /status and /metrics"
     );
     let app = App {
-        store,
-        indexer,
+        store: intake_store,
+        indexer: intake_indexer,
         limits: Limits {
             max_unmatched: args.max_unmatched,
             max_per_source: args.max_unmatched_per_source,
         },
+        door: Arc::new(Door::new(intake::Settings {
+            at_once: args.max_intake_at_once,
+            timeout: Duration::from_secs(args.intake_timeout_secs),
+            burst: args.intake_burst,
+            per_minute: args.intake_per_minute,
+            alert_at: args.intake_alert_refusals,
+        })),
         board,
         metrics,
+        alerts,
     };
+    let intake_watch = tokio::spawn(server::watch(app.clone(), cancel.clone()));
     let server = {
         let cancel = cancel.clone();
         let app = router(app, args.max_body_bytes)
@@ -143,6 +157,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     cancel.cancel();
     let _ = matcher.await;
+    let _ = intake_watch.await;
     server
         .await
         .context("The server task failed")?
@@ -150,13 +165,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
 }
 
 /// Checks what executing tickets needs and sets the executor up.
+/// Where the keeper's alerts go, under the name of the service.
+fn alerts(args: &Args, metrics: &Metrics, service: String) -> anyhow::Result<Arc<Alerts>> {
+    Ok(Arc::new(Alerts::new(
+        args.alert_webhook_url.clone(),
+        args.alert_format,
+        Duration::from_secs(args.alert_repeat_secs),
+        metrics.alerts.clone(),
+        service,
+    )?))
+}
+
 async fn executor(
     args: &Args,
     store: Store,
     indexer: Indexer,
     metrics: Arc<Metrics>,
     board: Arc<Board>,
-) -> anyhow::Result<Executor> {
+) -> anyhow::Result<(Executor, Arc<Alerts>)> {
     let (Some(path), Some(rpc_url), Some(key_file)) =
         (&args.deployment, &args.rpc_url, &args.key_file)
     else {
@@ -174,13 +200,7 @@ async fn executor(
         "Startup checks passed"
     );
     let snapshots = Snapshots::connect(&args.database_url, args.pool_size).await?;
-    let alerts = Arc::new(Alerts::new(
-        args.alert_webhook_url.clone(),
-        args.alert_format,
-        Duration::from_secs(args.alert_repeat_secs),
-        metrics.alerts.clone(),
-        format!("perp-keeper {}", tickers.join(",")),
-    )?);
+    let alerts = alerts(args, &metrics, format!("perp-keeper {}", tickers.join(",")))?;
     board.update(|s| s.address = Some(key.address.to_string()));
     if !args.check_only {
         alerts.raise(
@@ -197,7 +217,7 @@ async fn executor(
             ),
         );
     }
-    Ok(Executor::new(Parts {
+    let executor = Executor::new(Parts {
         settings: Settings {
             dry_run: args.dry_run,
             poll_interval: args.poll_interval(),
@@ -225,9 +245,10 @@ async fn executor(
         indexer,
         snapshots,
         metrics,
-        alerts,
+        alerts: alerts.clone(),
         board,
-    }))
+    });
+    Ok((executor, alerts))
 }
 
 async fn shutdown_signal() {

@@ -278,6 +278,18 @@ target/release/perp-keeper \
 `POST /v1/details`, `/health`, `/status` and `/metrics` are served on `--listen-address`
 (`127.0.0.1:9191`). The keeper sends no CORS headers: serve it under the site's own origin.
 
+Anyone can hand details in, and a flood of them must cost the open tickets nothing. The intake
+has database connections of its own (`--intake-pool-size`), apart from the ones the tickets are
+read and executed with. It works on `--max-intake-at-once` (8) requests at once, and takes
+`--intake-burst` (30) requests at once from one client and `--intake-per-minute` (60) over time.
+A request over a bound is turned away at once and not made to wait, with 503 or, for the client
+over its own allowance, 429, and a `Retry-After`; so is one whose details take longer than
+`--intake-timeout-secs` (5) to store. The front end signs nothing without the keeper's answer,
+so no ticket is made without its details. `perp_keeper_details_refused_total` counts the
+requests turned away by reason (`busy`, `rate`, `slow`); `--intake-alert-refusals` (100) of them
+within a minute are the `intake` problem on `/status` and one alert, taken back once a minute
+passes without any.
+
 ### Executing the stop tickets
 
 Given a deployment file, a full node and a key (`--deployment`, `--rpc-url` and `--key-file`,
@@ -386,5 +398,8 @@ is also the engine checking the keeper's encoding. The front end's side of the s
 (counted, then a problem on `/status` and one alert, gone once the details arrive), an indexer
 stopped while a position is opened again (without the lag limit the keeper cancels the stop loss
 of a position that is there; with it, an alert and no cancellation), TWAP tickets made with no gas
-or of too many chunks (left alone, the funded one run and finalized), and the indexer's database
-not answering (a warning, then `/health` 503 and an alert, healthy again afterwards).
+or of too many chunks (left alone, the funded one run and finalized), the indexer's database
+not answering (a warning, then `/health` 503 and an alert, healthy again afterwards), and a flood
+of the intake (one address answered 429 past its burst; 2,000 connections of made-up details
+turned away with 503 while the rounds keep their pace, `/health` answers and a stop loss made in
+the middle of it is executed; one alert, taken back a minute after the flood).

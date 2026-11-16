@@ -25,9 +25,35 @@ pub struct Args {
     /// read-only role is enough.
     #[clap(env = "PERP_DATABASE_URL", long)]
     pub database_url: Url,
-    /// Connections to each database.
+    /// Connections to each database for executing and matching.
     #[clap(long, default_value_t = 4)]
     pub pool_size: u32,
+    /// Connections to each database for the intake alone: handing details in never waits on
+    /// the connections that tickets are executed with, nor the other way round.
+    #[clap(long, default_value_t = 4)]
+    pub intake_pool_size: u32,
+    /// Requests the intake works on at once. One more is turned away with 503 and not made to
+    /// wait: the front end signs nothing without an answer, and can try again.
+    #[clap(long, default_value_t = 8)]
+    pub max_intake_at_once: usize,
+    /// How long storing the details of one request may take, in seconds, before it is turned
+    /// away with 503.
+    #[clap(long, default_value_t = 5)]
+    pub intake_timeout_secs: u64,
+    /// Requests one client may hand in at once; past them it has `--intake-per-minute`. The
+    /// front end hands the details of a ticket in up to six times, and makes two tickets for a
+    /// take profit and a stop loss. Zero for no limit. The client is told apart as for
+    /// `--max-unmatched-per-source`.
+    #[clap(long, default_value_t = 30)]
+    pub intake_burst: u32,
+    /// Requests one client gains back a minute, up to `--intake-burst`. One over is turned
+    /// away with 429.
+    #[clap(long, default_value_t = 60)]
+    pub intake_per_minute: u32,
+    /// Requests turned away within a minute that make a flood: a problem on `/status` and one
+    /// alert, until a minute passes without any. Zero for neither.
+    #[clap(long, default_value_t = 100)]
+    pub intake_alert_refusals: u64,
 
     /// The largest request body taken, in bytes. A ticket's details are a few hundred.
     #[clap(long, default_value_t = 4_096)]
@@ -177,6 +203,13 @@ impl Args {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(self.pool_size > 0, "--pool-size is 0");
+        ensure!(self.intake_pool_size > 0, "--intake-pool-size is 0");
+        ensure!(self.max_intake_at_once > 0, "--max-intake-at-once is 0");
+        ensure!(self.intake_timeout_secs > 0, "--intake-timeout-secs is 0");
+        ensure!(
+            self.intake_burst == 0 || self.intake_per_minute > 0,
+            "--intake-per-minute is 0: a client past its --intake-burst would never have a request again"
+        );
         ensure!(self.max_body_bytes > 0, "--max-body-bytes is 0");
         ensure!(self.max_unmatched > 0, "--max-unmatched is not positive");
         ensure!(

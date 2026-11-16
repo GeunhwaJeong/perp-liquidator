@@ -40,6 +40,10 @@ pub struct Metrics {
     /// over `--max-unmatched-per-source`) or `capacity` (the oldest of all, over
     /// `--max-unmatched`). A climb means someone floods the endpoint.
     pub details_evicted: IntCounterVec,
+    /// Requests the intake turned away, by why: `rate` (the client handed in more than it
+    /// may), `busy` (as many requests as are taken at once were being worked on) or `slow`
+    /// (storing the details took longer than a request may).
+    pub details_refused: IntCounterVec,
 }
 
 fn opts(name: &str, help: &str) -> Opts {
@@ -125,6 +129,16 @@ impl Metrics {
                     opts(
                         "details_evicted_total",
                         "Waiting details pushed out by newer ones, by why"
+                    ),
+                    &["reason"]
+                )
+            ),
+            details_refused: register!(
+                registry,
+                IntCounterVec::new(
+                    opts(
+                        "details_refused_total",
+                        "Requests the intake turned away, by why"
                     ),
                     &["reason"]
                 )

@@ -12,6 +12,7 @@
 pub mod config;
 pub mod details;
 pub mod executor;
+pub mod intake;
 pub mod matcher;
 pub mod metrics;
 pub mod ptb;

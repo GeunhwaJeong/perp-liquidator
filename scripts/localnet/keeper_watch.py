@@ -9,7 +9,8 @@
     scripts/localnet/keeper_watch.py down --work <the same directory> --postgres-bin <dir>
 
 `run` restarts the keeper with short waits and with an alert webhook that this script serves, and
-checks four things on a long of 0.05 BTC with a stop loss ticket (`--phase` picks some of them):
+checks five things, the first four on a long of 0.05 BTC with a stop loss ticket (`--phase` picks
+some of them):
 
 1. `stuck`: a ticket whose details the keeper does not have is only counted at first; after
    `--stuck-alert-after-secs` it is a problem on `/status`, named in the log and in one alert,
@@ -25,6 +26,11 @@ checks four things on a long of 0.05 BTC with a stop loss ticket (`--phase` pick
    answers. The failure is a warning at first; `--reading-critical-after-secs` after the first
    failed round `/health` is 503 with the reason and an alert is posted; with the database back
    the keeper is healthy again.
+5. `flood`: one address hands in more details at once than it may, and is answered 429 past its
+   burst. Then made-up details are handed in over 2,000 connections, every request from an
+   address of its own. The keeper turns them away at the door with 503, its rounds keep their
+   pace, `/health` answers, a stop loss ticket made in the middle of it is executed, the flood is
+   the `intake` problem on `/status` and one alert, and a minute after it the problem is gone.
 
 `up` and `down` are sltp_thin_book.py's: mark_drag.py's stack, a PostgreSQL cluster on --pg-port,
 the indexer and the keeper. The work directory has to be a new one each time.
@@ -34,6 +40,13 @@ keeper cancelled the ticket within the 27 s the indexer stood still, and the tic
 while the account held 0.05 BTC. In 4, a failed round takes the 10 s of the pool's connection
 timeout, so `/health` turned 21 s after the database stopped with a wait of 10 s.
 
+5 came the same day, with the bounds on the keeper's intake. The keeper with them turned
+194,109 of the flood's 196,538 requests away within 8 s, kept 1.7 rounds a second (it runs two
+when idle), answered `/health` in 0.03 s and executed the ticket 1.7 s after it was made. The
+keeper of daef48e, without them, took all 40 requests of the one address and all of the
+flood's, fell to 0.3 rounds a second with `/health` taking 5.8 s, executed the ticket after
+5.8 s, and failed five of the phase's eight checks.
+
 Needs grpcurl, Node 22, PostgreSQL's binaries, and built perp-indexer and perp-keeper binaries.
 Refuses to run anywhere but a local chain.
 """
@@ -41,6 +54,7 @@ Refuses to run anywhere but a local chain.
 import argparse
 import json
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -59,7 +73,60 @@ import sltp_thin_book as tb  # noqa: E402
 from mark_drag import LOT, call, obj  # noqa: E402
 
 KEEPER = tb.KEEPER
-PHASES = ["stuck", "lag", "twap", "reading"]
+PHASES = ["stuck", "lag", "twap", "reading", "flood"]
+# The flood of the last phase: connections that each send one request after another, every
+# request from an address of its own. The keeper's defaults take 8 requests at once, and 30 at
+# once from one address.
+FLOOD_AT_ONCE, AT_ONCE, BURST = 2_000, 8, 30
+# A stop loss over the index of 100,000, so that its price is crossed when the ticket is made,
+# and its worst price, 5% under it.
+CROSSED_STOP, CROSSED_WORST = 100_500, 95_475
+
+# Hands made-up details in over a fixed number of connections, each sending one request after
+# another, until it is killed. Every request carries a salt of its own, so that it hashes to a
+# commitment the keeper has not seen, and the address of a client of its own in X-Forwarded-For,
+# as the site's reverse proxy passes it on. The connections are kept: a client that opened one
+# for every request would run the machine out of local ports once the keeper answers at once.
+FLOOD_SCRIPT = r"""import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import http from 'node:http';
+
+const [url, file, connections] = process.argv.slice(2);
+const template = JSON.parse(readFileSync(file, 'utf8'));
+const agent = new http.Agent({ keepAlive: true, maxSockets: Number(connections), maxFreeSockets: Number(connections) });
+const counts = {};
+
+function post() {
+  const body = structuredClone(template);
+  body.details.salt = randomBytes(32).toString('hex');
+  const text = JSON.stringify(body);
+  const n = Math.floor(Math.random() * 2 ** 24);
+  const headers = {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(text),
+    'x-forwarded-for': `10.${n >> 16}.${(n >> 8) & 255}.${n & 255}`,
+  };
+  return new Promise((resolve) => {
+    const request = http.request(url, { method: 'POST', agent, headers }, (response) => {
+      response.resume();
+      response.on('end', () => resolve(String(response.statusCode)));
+    });
+    request.on('error', () => resolve('error'));
+    request.setTimeout(20_000, () => request.destroy());
+    request.end(text);
+  });
+}
+
+async function loop() {
+  for (;;) {
+    const key = await post();
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+}
+
+for (let i = 0; i < Number(connections); i += 1) loop();
+setInterval(() => console.log(JSON.stringify(counts)), 1000);
+"""
 # The keeper's waits in this check, in seconds: short, and the indexer's limit under the wait
 # after which a ticket without its position is cancelled.
 STUCK_SECS, LAG_SECS, READING_SECS, ORPHAN_SECS = 10, 8, 10, 15
@@ -358,6 +425,98 @@ class Check(tb.Check):
         say(f"  with the database back: /health {get('/health', 15)[0]}, problems {list(problems())}")
         expect("with the database back the keeper is healthy again", get("/health", 15)[0] == 200 and "reading" not in problems())
 
+    def hand_in(self, body, address=None):
+        """One request to the intake, from `address` as the site's reverse proxy would pass it
+        on. Returns the status code and the answer's headers."""
+        headers = {"Content-Type": "application/json"}
+        if address:
+            headers["X-Forwarded-For"] = address
+        req = urllib.request.Request(KEEPER + "/v1/details", data=json.dumps(body).encode(), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers
+
+    def flood(self):
+        say, expect = self.say, self.expect
+        say(f"--- 5. the intake is flooded over {FLOOD_AT_ONCE:,} connections, every request from an address of its own "
+            f"(the keeper takes {AT_ONCE} requests at once, and {BURST} at once from one address)")
+        # Every request in flight holds a connection, on the keeper's side and on the flood's.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = FLOOD_AT_ONCE * 4
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want if hard == resource.RLIM_INFINITY else min(want, hard), hard))
+        self.restart_keeper()
+        marker = len(self.log())
+        before = len(ALERTS)
+
+        answers = [self.hand_in(self.stop_loss(), address="203.0.113.7") for _ in range(BURST + 10)]
+        taken = sum(code == 200 for code, _ in answers)
+        over = [headers for code, headers in answers if code == 429]
+        say(f"  one address hands in {len(answers)} at once: {taken} taken, {len(over)} answered 429, Retry-After {over[0].get('Retry-After') if over else None}")
+        expect("one address has its burst, and is told when to come back for more",
+               BURST <= taken <= BURST + 2 and taken + len(over) == len(answers) and all(h.get("Retry-After") for h in over))
+
+        trader = self.new_address("flooded")
+        self.fund(trader, 5000)
+        account = self.create_account(trader, deposit_coin=self.tusd_coins(trader)[0][0])
+        self.open_position(account, trader, allocate=3000)
+        self.trade(trader, account, False, 50)
+        tb.wait(lambda: self.base(account) != 0, 20)
+        self.maker_order("the maker's bid", False, 50, 99_900)
+        # The details go in before the flood. Whether a new ticket's details get through it is
+        # not what this checks: the ticket is made in the middle of it, and has to be executed.
+        commitment = self.post(self.details(50, stop=CROSSED_STOP, worst=CROSSED_WORST))
+
+        script = self.s.work / "keeper-watch-flood.mjs"
+        script.write_text(FLOOD_SCRIPT)
+        template = self.s.work / "keeper-watch-flood.json"
+        template.write_text(json.dumps(self.stop_loss()))
+        counts_file = self.s.logs / "keeper-watch-flood.log"
+        with open(counts_file, "w") as out:
+            flood = subprocess.Popen([self.s.node, str(script), KEEPER + "/v1/details", str(template), str(FLOOD_AT_ONCE)],
+                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            time.sleep(4)
+            ticket = self.stop_ticket("a stop loss ticket whose price is crossed", trader, account, commitment)
+            made = time.time()
+            rounds_before, slowest, seen, executed = metric("perp_keeper_rounds_total"), 0.0, set(), None
+            while time.time() < made + 8:
+                at = time.time()
+                get("/health", 15)
+                slowest = max(slowest, time.time() - at)
+                seen.update(problems())
+                if executed is None and self.status(ticket) == "executed":
+                    executed = time.time() - made
+                time.sleep(0.5)
+            pace = (metric("perp_keeper_rounds_total") - rounds_before) / (time.time() - made)
+            lines = counts_file.read_text().splitlines()
+            counts = json.loads(lines[-1]) if lines else {}
+            say(f"  8 s of it: the flood's answers {counts}; {pace:.2f} rounds a second, slowest /health {slowest:.2f} s, problems {sorted(seen)}")
+            expect("the flood is turned away at the door: more requests answered 503 than taken",
+                   counts.get("503", 0) > counts.get("200", 0) > 0)
+            expect("the keeper's rounds keep their pace", pace >= 1.0)
+            expect("/health answers within two seconds and the tickets can be read", slowest < 2.0 and "reading" not in seen)
+            if executed is None and tb.wait(lambda: self.status(ticket) == "executed", 22):
+                executed = time.time() - made
+            say(f"  the ticket made in the middle of it: {self.status(ticket)}"
+                + (f" {executed:.1f} s after it was made" if executed is not None else "") + f", position {self.base(account)} BTC")
+            expect("a stop loss whose price is crossed is executed within 30 s", executed is not None)
+            tb.wait(lambda: "intake" in problems(), 10)
+            told = [a for a in ALERTS[before:] if "The intake turned" in a]
+            say(f"  alert posted: {told[0][:200] if told else None}")
+            expect("the flood is a problem on /status and one alert, and the keeper stays healthy",
+                   "intake" in problems() and len(told) == 1 and get("/health", 15)[0] == 200)
+        finally:
+            os.killpg(flood.pid, signal.SIGTERM)
+        tb.wait(lambda: "intake" not in problems(), 80)
+        log = self.log()[marker:]
+        say(f"  with the flood over: problems {list(problems())}")
+        expect("a minute after the flood the problem is taken back", "intake" not in problems())
+        expect("no request waited for a connection until it timed out, and none deadlocked",
+               "Timed out in bb8" not in log and "deadlock detected" not in log)
+
     def run(self):
         self.s.assert_local()
         say = self.say
@@ -383,6 +542,8 @@ class Check(tb.Check):
             self.twap(trader, account)
         if "reading" in phases:
             self.reading()
+        if "flood" in phases:
+            self.flood()
         say("=== " + ("all as expected" if not self.failed else f"{len(self.failed)} FAILED: " + "; ".join(self.failed)) + " ===")
         return not self.failed
 
@@ -400,7 +561,7 @@ def main():
     parser.add_argument("--indexer", default="~/perp-indexer/perp-indexer/target/debug/perp-indexer", help="the perp-indexer binary")
     parser.add_argument("--keeper", default=str(tb.REPO / "target/debug/perp-keeper"), help="the perp-keeper binary")
     parser.add_argument("--sink-port", type=int, default=18999, help="the port this script takes the keeper's alerts on")
-    parser.add_argument("--phase", action="append", choices=PHASES, help="a phase to run; all four by default")
+    parser.add_argument("--phase", action="append", choices=PHASES, help="a phase to run; all five by default")
     args = parser.parse_args()
     stack = md.Stack(args)
     if args.step == "up":

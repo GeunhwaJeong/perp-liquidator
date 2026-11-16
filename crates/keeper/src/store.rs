@@ -163,10 +163,15 @@ pub struct Store {
 }
 
 impl Store {
-    pub async fn connect(url: &Url, pool_size: u32) -> anyhow::Result<Self> {
-        let store = Self {
+    /// Connections of their own to the details database, whose table another handle made.
+    pub async fn connect_only(url: &Url, pool_size: u32) -> anyhow::Result<Self> {
+        Ok(Self {
             pool: pool(url, pool_size, "details database").await?,
-        };
+        })
+    }
+
+    pub async fn connect(url: &Url, pool_size: u32) -> anyhow::Result<Self> {
+        let store = Self::connect_only(url, pool_size).await?;
         let mut conn = store.pool.get().await.context("No database connection")?;
         for statement in SCHEMA {
             sql_query(statement)
@@ -218,11 +223,15 @@ impl Store {
         }
         let mut evicted = Evicted::default();
         if !held {
+            // Requests at once push the same oldest rows out. A row another request has
+            // locked is on its way out already and is skipped: two deletes that took their
+            // rows in different orders would wait on each other, and one would fail.
             evicted.source = sql_query(
                 "DELETE FROM ticket_details WHERE commitment IN (
                     SELECT commitment FROM ticket_details
                     WHERE matched_at_ms IS NULL AND source = $1
-                    ORDER BY submitted_at_ms DESC, commitment OFFSET $2)",
+                    ORDER BY submitted_at_ms DESC, commitment OFFSET $2
+                    FOR UPDATE SKIP LOCKED)",
             )
             .bind::<Text, _>(source)
             .bind::<BigInt, _>(limits.max_per_source - 1)
@@ -231,7 +240,8 @@ impl Store {
             evicted.capacity = sql_query(
                 "DELETE FROM ticket_details WHERE commitment IN (
                     SELECT commitment FROM ticket_details WHERE matched_at_ms IS NULL
-                    ORDER BY submitted_at_ms DESC, commitment OFFSET $1)",
+                    ORDER BY submitted_at_ms DESC, commitment OFFSET $1
+                    FOR UPDATE SKIP LOCKED)",
             )
             .bind::<BigInt, _>(limits.max_unmatched - 1)
             .execute(&mut conn)
