@@ -233,6 +233,17 @@ Verified on mainnet: a dry run against the live deployment simulates every round
 from the laptop posted ten levels around $85,845 in three rounds, the public order book showed
 them, and stopping pulled them all.
 
+`scripts/localnet/maker_check.py` checks what the maker does when a round cannot go through as it
+is, on `mark_drag.py`'s stack with a maker, an alert webhook and a proxy in front of the node of
+its own: an order resting inside the spread (the level that would match is left out, the others
+rest, no round fails), a move of the price with that order resting (the bids are under the new
+price within seconds, and a sale down to it takes nothing of the maker's), a move the signed
+source refuses for twenty seconds (the quotes are pulled at the first failure, the round is tried
+again every three seconds, `/health` fails and one alert is posted, and both are taken back when
+a round goes through), and a round whose answer is cut off (taken over at the next poll when it
+ran, the quotes of before kept when it did not). It needs no indexer: the maker's orders are read
+from its position on chain.
+
 ## Keeper
 
 A stop or TWAP order ticket holds only a blake2b-256 commitment to its details, and only an

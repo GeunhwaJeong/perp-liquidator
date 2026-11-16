@@ -267,13 +267,17 @@ rounding to tick and lot on each side, level sizes and the minimum order value, 
 inventory states, the re-quote triggers. Unit tests on `ptb.rs`: the calls of a round in order,
 post-only type and expiry on every level, the fee extension's `end_session` when configured.
 
-`scripts/localnet/maker_check.py` on the held localnet stack, in phases: a startup refusal (wrong
-cap); the first round posts `2 × levels` orders around the signed price; a 10 bp move of the
-signed price re-quotes within one interval and the old orders are gone; a taker fill (the flow
-role, one order) moves inventory and the next round is skewed; inventory pushed past `q_max`
-leaves only the reduce-only side; past `q_hard` the flatten order appears; a stale price pulls
-every quote; stopping the bot leaves the book empty after the expiry; the flow simulator alone
-produces candles the indexer serves.
+`scripts/localnet/maker_check.py`, on a localnet stack of its own, checks what the maker does
+when a round cannot go through as it is, in four phases: a level that would match a resting
+order is left out and the rest of the round lands, and stopping pulls the quotes; after a move
+of the price the bids are not left above it for a taker to sell into; rounds that fail pull the
+quotes, are tried again at the pace of the rounds and raise one alert, and another when they
+go through again; a round that got no answer is taken over when it ran, and the quotes of
+before stay when it did not.
+
+Not written: the checks of the quoting itself on a local network (the skew after a fill, the
+reduce-only side past `q_max`, the flatten order past `q_hard`, a stale price pulling every
+quote, the flow simulator's candles). The unit tests of `model.rs` cover the first three.
 
 ## 10. Rollout on the shadow run
 
