@@ -139,11 +139,11 @@ pub struct Args {
     /// Quote nothing on a confidence interval wider than this, in basis points.
     #[clap(long, default_value = "50")]
     pub max_confidence_bps: BigDecimal,
-    /// Failures in a row after which quoting stops for `--retry-secs`.
-    #[clap(long, default_value_t = 3)]
-    pub max_failures: u32,
-    #[clap(long, default_value_t = 60)]
-    pub retry_secs: u64,
+    /// A round that fails pulls what rests and is tried again every `--min-interval-secs`. Once
+    /// no round has gone through for this long, in seconds, it is a critical alert and
+    /// `/health` fails.
+    #[clap(long, default_value_t = 30)]
+    pub failing_alert_after_secs: u64,
     /// Sign nothing whose gas budget is above this, in the smallest unit of HANEUL.
     #[clap(long, default_value_t = 500_000_000)]
     pub max_gas_budget: u64,

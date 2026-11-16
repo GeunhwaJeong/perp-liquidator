@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The quoting loop: look at the reference and the position every poll, decide whether a round
-//! is due, build it as one transaction, simulate, send, and remember what rests.
+//! is due, build it as one transaction, simulate, send, and remember what rests. A level that
+//! would match a resting order is left out of the round; a round that fails pulls what rests
+//! and is tried again; a transaction that got no answer is asked for until the full node tells
+//! what became of it (`failures`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bigdecimal::{BigDecimal, ToPrimitive, Zero};
 use haneul_crypto::HaneulSigner;
+use haneul_sdk_types::Transaction;
 use haneul_transaction_builder::{ObjectInput, TransactionBuilder};
 use perp_bot_common::alerts::{Alerts, Level};
 use perp_bot_common::chain::{Abort, BuildError, Chain, ExecuteError, Outcome};
@@ -18,9 +22,10 @@ use perp_engine::Position;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::failures::{self, Failures, POST_ONLY_WOULD_MATCH, Verdict};
 use crate::market::{self, MarketView};
 use crate::metrics::Metrics;
-use crate::model::{self, Inventory, Observation, Params, Quote};
+use crate::model::{self, Inventory, Level as Quoted, Observation, Params, Quote, Sigma};
 use crate::ptb::{Builder, Round};
 use crate::setup::Role;
 use crate::status::{Board, LevelStatus, RoundRecord, now_ms};
@@ -32,8 +37,6 @@ const REFRESH_EVERY: Duration = Duration::from_secs(60);
 /// by every market in the collateral, so writing it from every round would order all of them
 /// behind one object.
 const COLLATERAL_RELAY_AGE_MS: u64 = 15_000;
-/// `clearing_house::EPostOnlyOrderWouldMatch`.
-const POST_ONLY_WOULD_MATCH: u64 = 47;
 /// `clearing_house::ENotEnoughCollateralToAllocateForSession`.
 const NOT_ENOUGH_COLLATERAL: u64 = 30;
 /// `market::EBadIndexPrice`.
@@ -52,8 +55,8 @@ pub struct Settings {
     pub vol_alpha: BigDecimal,
     pub max_price_age: Duration,
     pub max_confidence_bps: BigDecimal,
-    pub max_failures: u32,
-    pub retry: Duration,
+    /// How long rounds may fail in a row before it is a critical problem.
+    pub failing_alert_after: Duration,
     pub max_gas_budget: u64,
     pub min_gas_balance: f64,
     pub params_refresh: Duration,
@@ -77,16 +80,27 @@ pub struct Parts {
 /// What the maker remembers between polls.
 #[derive(Default)]
 struct State {
-    last_reference: BigDecimal,
-    sigma_bps: BigDecimal,
+    sigma: Sigma,
+    /// When the last round went through: the refresh counts from it.
     last_round_at: Option<Instant>,
+    /// When a round, or the pull after a failed read, was last tried, whether it went through
+    /// or not: the pace counts from it.
+    last_attempt_at: Option<Instant>,
     last_quote: Option<Quote>,
     /// The order IDs the last round posted, as far as known.
     resting: Vec<u128>,
+    /// The levels the last round posted, and when they expire. Past that time the engine no
+    /// longer matches them, whether or not they were cancelled.
+    posted: Vec<Quoted>,
+    expires_at_ms: u64,
     /// (base, bids, asks) of the position after the last round.
     last_position: Option<(BigDecimal, BigDecimal, BigDecimal)>,
-    failures: u32,
-    paused_until: Option<Instant>,
+    /// The position's base at the last poll that read it.
+    seen_base: Option<BigDecimal>,
+    failures: Failures,
+    /// Transactions that were sent and got no answer, until the full node tells what became
+    /// of them.
+    pending: Vec<Pending>,
     client_ids: u64,
     view_read_at: Option<Instant>,
 }
@@ -96,6 +110,40 @@ pub struct Maker {
     s: State,
     gas_price: Option<(u64, Instant)>,
     gas_checked: Option<Instant>,
+}
+
+/// A transaction the full node did not build: its simulation aborted or failed, the node did
+/// not answer, or the gas it needs is above the limit. Nothing was sent.
+struct Refusal {
+    abort: Option<Abort>,
+    message: String,
+}
+
+/// What a transaction leaves resting when it runs: the levels of a round, until they expire.
+#[derive(Clone, Copy)]
+struct Posts<'a> {
+    levels: &'a [Quoted],
+    left_out: usize,
+    expires_at_ms: u64,
+}
+
+/// A transaction that was sent and got no answer: it may have run.
+struct Pending {
+    digest: String,
+    sent_at: Instant,
+    /// The levels it posts when it runs, and when they expire. None for a pull.
+    posts: Option<(Vec<Quoted>, u64)>,
+    /// The quote and the position a round was built for.
+    built_for: Option<(Quote, (BigDecimal, BigDecimal, BigDecimal))>,
+}
+
+/// A round that went through.
+struct Sent {
+    outcome: Outcome,
+    /// The levels it posted: the quote's, less the ones that would have matched.
+    levels: Vec<Quoted>,
+    left_out: usize,
+    expires_at_ms: u64,
 }
 
 /// What a poll decided.
@@ -131,6 +179,7 @@ impl Maker {
                 break;
             }
             self.poll().await;
+            self.p.board.poll_done();
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(self.p.settings.poll_interval) => {}
@@ -146,14 +195,8 @@ impl Maker {
     /// One look at the reference and the position.
     pub async fn poll(&mut self) -> Decision {
         self.check_gas().await;
-        if let Some(until) = self.s.paused_until {
-            if Instant::now() < until {
-                return Decision::Idle;
-            }
-            self.s.paused_until = None;
-            self.s.failures = 0;
-            self.p.board.clear_problem("failing");
-        }
+        self.resolve().await;
+        self.report_resting();
 
         // The reference: the signed price of the base feed, fresh and confident enough.
         let updates = match self.p.oracle.fetch().await {
@@ -205,8 +248,9 @@ impl Maker {
         let view = match self.view().await {
             Ok(view) => view,
             Err(e) => {
-                warn!("Failed to read the market: {e:#}");
-                return Decision::Failed;
+                return self
+                    .unread(&format!("the market could not be read: {e:#}"))
+                    .await;
             }
         };
         if !view.trades() {
@@ -219,30 +263,36 @@ impl Maker {
         let (position, mark, collateral_price) = match self.position_and_marks(&view).await {
             Ok(x) => x,
             Err(e) => {
-                warn!("Failed to read the position: {e:#}");
-                return Decision::Failed;
+                return self
+                    .unread(&format!("the position could not be read: {e:#}"))
+                    .await;
             }
         };
         let valuation = view.valuation(mark, collateral_price);
         let health = market::health(&position, &valuation, &view.margin_ratio_maintenance);
         // Every fill moves the position; the resting quantities also move with the maker's
-        // own posting and cancelling, so they are not a sign of one.
+        // own posting and cancelling, so they are not a sign of one. The round is due for as
+        // long as the position differs from the last round's; the counter counts the change
+        // once, at the poll that first sees it.
         let fills = self
             .s
             .last_position
             .as_ref()
             .is_some_and(|(base, _, _)| *base != position.base);
-        if fills {
+        if self
+            .s
+            .seen_base
+            .as_ref()
+            .is_some_and(|base| *base != position.base)
+        {
             self.p.metrics.fills.inc();
         }
+        self.s.seen_base = Some(position.base.clone());
 
         // The quote.
-        self.s.sigma_bps = model::update_sigma(
-            &self.s.sigma_bps,
-            &self.s.last_reference,
-            &reference,
-            &self.p.settings.vol_alpha,
-        );
+        self.s
+            .sigma
+            .observe(&reference, update.timestamp_ms, &self.p.settings.vol_alpha);
         let mut params = self.p.settings.params.clone();
         params.tick = view.tick_size;
         params.lot = view.lot_size;
@@ -250,49 +300,39 @@ impl Maker {
         let observation = Observation {
             reference: reference.clone(),
             confidence_bps,
-            sigma_bps: self.s.sigma_bps.clone(),
+            sigma_bps: self.s.sigma.bps().clone(),
             position: position.base.clone(),
             health: health.clone(),
         };
         let quote = model::quote(&params, &observation);
         self.observe(&quote, &position, &health);
-        self.s.last_reference = reference.clone();
 
         // Is a round due?
         let reason = self.reason(&quote, fills);
         let Some(reason) = reason else {
             return Decision::Idle;
         };
-        if let Some(at) = self.s.last_round_at
-            && at.elapsed() < self.p.settings.min_interval
-        {
-            debug!(reason, "A round is due but the last one was too recent");
+        if !failures::due(
+            self.s.last_attempt_at,
+            self.p.settings.min_interval,
+            Instant::now(),
+        ) {
+            debug!(reason, "A round is due but the last try was too recent");
             return Decision::Idle;
         }
+        self.s.last_attempt_at = Some(Instant::now());
         self.p.metrics.reasons.with_label_values(&[reason]).inc();
 
-        // Build it.
-        let now = now_ms() as u64;
-        let round = Round {
-            cancel: self.s.resting.clone(),
-            levels: quote.levels.clone(),
-            flatten: quote.flatten.clone(),
-            expires_at_ms: now + self.p.settings.expire.as_millis() as u64,
-            client_id_base: self.next_client_ids(quote.levels.len() as u64),
-        };
-        let relayed = self.relayed(&updates, &update).await;
-        let mut b = Builder::new(&self.p.role.engine, &ObjectInput::new);
-        b.refresh(Some((&updates.relay, &relayed)))
-            .round(&self.p.role.market, &round);
-        let commands = b.commands();
-        let tx = b.finish();
-        match self.send(tx, commands, reason, round.levels.len()).await {
-            Ok(outcome) => {
+        let unanswered = self.s.pending.len();
+        match self.round(&quote, &updates, &update, reason).await {
+            Ok(sent) => {
                 self.s.resting = if self.p.settings.dry_run {
                     Vec::new()
                 } else {
-                    posted_order_ids(&outcome)
+                    posted_order_ids(&sent.outcome)
                 };
+                self.s.posted = sent.levels;
+                self.s.expires_at_ms = sent.expires_at_ms;
                 self.s.last_round_at = Some(Instant::now());
                 self.s.last_quote = Some(quote.clone());
                 self.s.last_position = Some((
@@ -300,15 +340,13 @@ impl Maker {
                     position.bids_quantity.clone(),
                     position.asks_quantity.clone(),
                 ));
-                self.s.failures = 0;
-                self.p.board.clear_problem("failing");
-                let quoting = !round.levels.is_empty();
-                self.p.metrics.quoting.set(quoting as i64);
-                self.p.board.update(|s| s.quoting = quoting);
+                self.went_through();
+                self.report_resting();
                 info!(
                     reason,
-                    digest = outcome.digest,
-                    levels = round.levels.len(),
+                    digest = sent.outcome.digest,
+                    levels = self.s.posted.len(),
+                    left_out = sent.left_out,
                     resting = self.s.resting.len(),
                     mid = %quote.mid.with_scale(2),
                     half_spread_bps = %quote.half_spread_bps.with_scale(2),
@@ -319,8 +357,161 @@ impl Maker {
             }
             Err(message) => {
                 self.failed(&message);
+                match self.s.pending.get_mut(unanswered) {
+                    // No answer: the round may have run, and a pull on top of it would spend
+                    // the same objects. The next poll asks what became of it.
+                    Some(pending) => {
+                        pending.built_for = Some((
+                            quote.clone(),
+                            (
+                                position.base.clone(),
+                                position.bids_quantity.clone(),
+                                position.asks_quantity.clone(),
+                            ),
+                        ));
+                    }
+                    None => self.retreat().await,
+                }
                 Decision::Failed
             }
+        }
+    }
+
+    /// Asks the full node what became of the transactions that got no answer.
+    async fn resolve(&mut self) {
+        for pending in std::mem::take(&mut self.s.pending) {
+            let found = match self.p.chain.transaction(&pending.digest).await {
+                Ok(found) => found,
+                Err(e) => {
+                    debug!(
+                        digest = pending.digest,
+                        "Failed to look up the transaction: {e:#}"
+                    );
+                    None
+                }
+            };
+            let verdict = failures::verdict(
+                found.as_ref().map(|outcome| outcome.success),
+                pending.sent_at.elapsed(),
+                self.p.settings.expire,
+            );
+            match (verdict, found) {
+                (Verdict::AskAgain, _) => self.s.pending.push(pending),
+                (Verdict::TakeOver, Some(outcome)) => self.take_over(pending, &outcome),
+                (Verdict::Forget, Some(outcome)) => warn!(
+                    "The transaction that got no answer ran and changed nothing: {}",
+                    failure(&outcome)
+                ),
+                (_, None) => warn!(
+                    digest = pending.digest,
+                    "The full node has not had the transaction that got no answer for {} s, \
+                     and nothing it posted can be matched any more",
+                    pending.sent_at.elapsed().as_secs()
+                ),
+            }
+        }
+    }
+
+    /// A transaction that got no answer ran: what it posted rests, what it cancelled is gone.
+    fn take_over(&mut self, pending: Pending, outcome: &Outcome) {
+        info!(
+            digest = pending.digest,
+            "The transaction that got no answer ran"
+        );
+        self.p
+            .metrics
+            .gas_spent
+            .inc_by(outcome.gas_used.max(0) as u64);
+        let ids = posted_order_ids(outcome);
+        // A round that went through after this one was sent says what rests. The orders of
+        // this one are then only more to cancel.
+        if self.s.last_round_at.is_some_and(|at| at > pending.sent_at) {
+            for id in ids {
+                if !self.s.resting.contains(&id) {
+                    self.s.resting.push(id);
+                }
+            }
+            return;
+        }
+        let Some((levels, expires_at_ms)) = pending.posts else {
+            self.pulled();
+            return;
+        };
+        self.s.resting = ids;
+        self.s.posted = levels;
+        self.s.expires_at_ms = expires_at_ms;
+        self.s.last_round_at = Some(pending.sent_at);
+        if let Some((quote, position)) = pending.built_for {
+            self.s.last_quote = Some(quote);
+            self.s.last_position = Some(position);
+        }
+        // The missing answer was counted as a failure. When nothing failed after it, the run
+        // of failures ends with this round.
+        if self.s.failures.count() <= 1 {
+            self.went_through();
+        }
+        self.report_resting();
+    }
+
+    /// Builds and sends the round of a quote. A level that would match a resting order is left
+    /// out and the round is built again, so that the cancels and the rest of the ladder land:
+    /// every try drops one level, and a round without levels has nothing left to match.
+    async fn round(
+        &mut self,
+        quote: &Quote,
+        updates: &Updates,
+        base: &SignedUpdate,
+        reason: &'static str,
+    ) -> Result<Sent, String> {
+        let expires_at_ms = now_ms() as u64 + self.p.settings.expire.as_millis() as u64;
+        let mut round = Round {
+            cancel: self.s.resting.clone(),
+            levels: quote.levels.clone(),
+            flatten: quote.flatten.clone(),
+            expires_at_ms,
+            client_id_base: self.next_client_ids(quote.levels.len() as u64),
+        };
+        let relayed = self.relayed(updates, base).await;
+        loop {
+            let mut b = Builder::new(&self.p.role.engine, &ObjectInput::new);
+            b.refresh(Some((&updates.relay, &relayed)))
+                .round(&self.p.role.market, &round);
+            let commands = b.commands();
+            let placed = b.placed().to_vec();
+            let tx = match self.build(b.finish(), &commands).await {
+                Ok(tx) => tx,
+                Err(refusal) => {
+                    let crossing = refusal
+                        .abort
+                        .as_ref()
+                        .and_then(|abort| failures::crossing_level(abort, &placed));
+                    let Some(index) = crossing else {
+                        self.p.metrics.rounds.with_label_values(&["refused"]).inc();
+                        return Err(refusal.message);
+                    };
+                    let level = round.levels.remove(index);
+                    self.p.metrics.left_out.inc();
+                    debug!(
+                        side = if level.is_bid { "bid" } else { "ask" },
+                        price = units(level.price),
+                        "A level would have matched a resting order and is left out"
+                    );
+                    continue;
+                }
+            };
+            let left_out = quote.levels.len() - round.levels.len();
+            let posts = Posts {
+                levels: &round.levels,
+                left_out,
+                expires_at_ms,
+            };
+            let outcome = self.submit(tx, reason, Some(posts)).await?;
+            return Ok(Sent {
+                outcome,
+                levels: round.levels,
+                left_out,
+                expires_at_ms,
+            });
         }
     }
 
@@ -374,11 +565,10 @@ impl Maker {
                 .alerts
                 .raise(Level::Warning, key, format!("Quoting stopped: {message}"));
         }
-        if self.s.resting.is_empty() && self.s.last_quote.is_none() {
-            return Decision::Idle;
-        }
         if self.s.resting.is_empty() {
             self.s.last_quote = None;
+            // No round is tried while the condition lasts, so none fails either.
+            self.settle();
             return Decision::Idle;
         }
         self.pull(key).await
@@ -386,23 +576,16 @@ impl Maker {
 
     async fn pull(&mut self, reason: &'static str) -> Decision {
         if self.p.settings.dry_run {
-            self.s.resting.clear();
-            self.s.last_quote = None;
+            self.pulled();
             return Decision::Pulled(reason);
         }
         let mut b = Builder::new(&self.p.role.engine, &ObjectInput::new);
         b.pull(&self.p.role.market, &self.s.resting);
         let commands = b.commands();
-        match self.send(b.finish(), commands, "pull", 0).await {
+        match self.send(b.finish(), &commands, "pull").await {
             Ok(_) => {
-                self.s.resting.clear();
-                self.s.last_quote = None;
-                self.p.metrics.quoting.set(0);
-                self.p.board.update(|s| {
-                    s.quoting = false;
-                    s.ladder.clear();
-                    s.resting_orders = 0;
-                });
+                self.pulled();
+                self.settle();
                 info!(reason, "Pulled the quotes");
                 Decision::Pulled(reason)
             }
@@ -413,37 +596,117 @@ impl Maker {
         }
     }
 
-    /// Builds, prices, simulates and (unless a dry run) sends.
+    /// After a round that failed: what rests was posted for a price or a position the maker
+    /// could not follow up on, so it is cancelled. A cancel needs no session and no fresh
+    /// price, and goes through in most of the cases in which a round does not. When it does
+    /// not either, the quotes rest until they expire.
+    async fn retreat(&mut self) {
+        if self.s.resting.is_empty() || self.p.settings.dry_run {
+            return;
+        }
+        let mut b = Builder::new(&self.p.role.engine, &ObjectInput::new);
+        b.pull(&self.p.role.market, &self.s.resting);
+        let commands = b.commands();
+        match self.send(b.finish(), &commands, "retreat").await {
+            Ok(_) => {
+                self.pulled();
+                info!("Pulled the quotes after the failure");
+            }
+            Err(message) => {
+                warn!("The quotes could not be pulled and rest until they expire: {message}");
+            }
+        }
+    }
+
+    /// A poll that could not read the market or the position. It counts as a failure, and what
+    /// rests is pulled at the pace of the rounds: the maker cannot tell what it should quote.
+    async fn unread(&mut self, message: &str) -> Decision {
+        self.failed(message);
+        if failures::due(
+            self.s.last_attempt_at,
+            self.p.settings.min_interval,
+            Instant::now(),
+        ) {
+            self.s.last_attempt_at = Some(Instant::now());
+            self.retreat().await;
+        }
+        Decision::Failed
+    }
+
+    /// Nothing of the maker's rests any more.
+    fn pulled(&mut self) {
+        self.s.resting.clear();
+        self.s.posted.clear();
+        self.s.last_quote = None;
+        self.report_resting();
+    }
+
+    /// A transaction that only cancels: built, simulated and (unless a dry run) sent.
     async fn send(
         &mut self,
-        mut tx: TransactionBuilder,
-        commands: String,
+        tx: TransactionBuilder,
+        commands: &str,
         reason: &'static str,
-        levels: usize,
     ) -> Result<Outcome, String> {
+        let tx = match self.build(tx, commands).await {
+            Ok(tx) => tx,
+            Err(refusal) => {
+                self.p.metrics.rounds.with_label_values(&["refused"]).inc();
+                return Err(refusal.message);
+            }
+        };
+        self.submit(tx, reason, None).await
+    }
+
+    /// Resolves and prices the transaction. The full node simulates it to do so, so that one
+    /// that would abort is refused here, with the command that aborted.
+    async fn build(
+        &mut self,
+        mut tx: TransactionBuilder,
+        commands: &str,
+    ) -> Result<Transaction, Refusal> {
         tx.set_sender(self.p.key.address);
         if let Some(price) = self.gas_price().await {
             tx.set_gas_price(price);
         }
         let tx = match self.p.chain.build(tx).await {
             Ok(tx) => tx,
-            Err(e) => {
-                let message = match &e {
-                    BuildError::Aborted(abort) => format!("{} [{}]", describe(abort), commands),
-                    other => other.to_string(),
-                };
-                self.p.metrics.rounds.with_label_values(&["refused"]).inc();
-                return Err(message);
+            Err(BuildError::Aborted(abort)) => {
+                return Err(Refusal {
+                    message: format!("{} [{}]", describe(&abort), commands),
+                    abort: Some(abort),
+                });
+            }
+            Err(other) => {
+                return Err(Refusal {
+                    abort: None,
+                    message: other.to_string(),
+                });
             }
         };
         let budget = tx.gas_payment.budget;
         if budget > self.p.settings.max_gas_budget {
-            self.p.metrics.rounds.with_label_values(&["refused"]).inc();
-            return Err(format!(
-                "gas budget {budget} is above --max-gas-budget {}",
-                self.p.settings.max_gas_budget
-            ));
+            return Err(Refusal {
+                abort: None,
+                message: format!(
+                    "gas budget {budget} is above --max-gas-budget {}",
+                    self.p.settings.max_gas_budget
+                ),
+            });
         }
+        Ok(tx)
+    }
+
+    /// Simulates a built transaction (a dry run) or signs and sends it. `posts` is what a round
+    /// leaves resting; a pull leaves nothing.
+    async fn submit(
+        &mut self,
+        tx: Transaction,
+        reason: &'static str,
+        posts: Option<Posts<'_>>,
+    ) -> Result<Outcome, String> {
+        let levels = posts.map_or(0, |p| p.levels.len());
+        let left_out = posts.map_or(0, |p| p.left_out);
         if self.p.settings.dry_run {
             return match self.p.chain.simulate(&tx).await {
                 Ok(outcome) if outcome.success => {
@@ -458,6 +721,7 @@ impl Maker {
                         outcome: "simulated".to_owned(),
                         digest: None,
                         levels,
+                        left_out,
                         gas: outcome.gas_used,
                     });
                     Ok(outcome)
@@ -485,6 +749,7 @@ impl Maker {
                     outcome: "executed".to_owned(),
                     digest: Some(outcome.digest.clone()),
                     levels,
+                    left_out,
                     gas: outcome.gas_used,
                 });
                 Ok(outcome)
@@ -496,26 +761,37 @@ impl Maker {
             }
             Err(ExecuteError::Rejected(e)) => {
                 self.p.metrics.rounds.with_label_values(&["rejected"]).inc();
+                // A reference gas price that rose with the epoch is one reason for it, and
+                // the price is otherwise read once a minute.
+                self.gas_price = None;
                 Err(format!("rejected: {e}"))
             }
             Err(ExecuteError::Unknown(e)) => {
                 self.p.metrics.rounds.with_label_values(&["unknown"]).inc();
-                // It may have landed: the resting IDs are no longer trusted, so the next
-                // round cancels nothing it does not find and the expiry clears the rest.
-                self.s.resting.clear();
+                // It may have run. What was known to rest is kept: a cancel skips the orders
+                // that are gone. What this one posts is taken over once the full node has it.
+                self.s.pending.push(Pending {
+                    digest: tx.digest().to_string(),
+                    sent_at: Instant::now(),
+                    posts: posts.map(|p| (p.levels.to_vec(), p.expires_at_ms)),
+                    built_for: None,
+                });
                 Err(format!("no answer: {e}"))
             }
         }
     }
 
+    /// Counts a failure. Once rounds have failed for `--failing-alert-after-secs` in a row it is
+    /// a critical problem: `/health` fails and one alert is raised for the run.
     fn failed(&mut self, message: &str) {
-        self.s.failures += 1;
-        warn!(failures = self.s.failures, "{message}");
-        if self.s.failures >= self.p.settings.max_failures {
+        let lasted = self.s.failures.record(Instant::now());
+        let failures = self.s.failures.count();
+        warn!(failures, "{message}");
+        self.p.board.update(|s| s.failures = failures);
+        if lasted >= self.p.settings.failing_alert_after {
             let text = format!(
-                "{} rounds failed in a row, quoting stops for {} s: {message}",
-                self.s.failures,
-                self.p.settings.retry.as_secs()
+                "No round has gone through for {} s, {failures} failures in a row: {message}",
+                lasted.as_secs()
             );
             if self
                 .p
@@ -524,10 +800,55 @@ impl Maker {
             {
                 self.p.alerts.raise(Level::Critical, "failing", text);
             }
-            self.s.paused_until = Some(Instant::now() + self.p.settings.retry);
-            // Whatever rests expires on its own.
-            self.s.last_quote = None;
         }
+    }
+
+    /// Ends a run of failures; true when it had become a problem.
+    fn settle(&mut self) -> bool {
+        self.s.failures.clear();
+        self.p.board.update(|s| s.failures = 0);
+        self.p.board.clear_problem("failing")
+    }
+
+    /// A round went through: a run of failures is over.
+    fn went_through(&mut self) {
+        if self.settle() {
+            // Under a key of its own: the alert it answers was posted less than a repeat
+            // interval ago, and the same key would hold this one back.
+            self.p
+                .alerts
+                .raise(Level::Info, "failing_over", "Rounds go through again");
+        }
+    }
+
+    /// Tells `/status` and the metrics what rests: the levels of the last round until they
+    /// expire, and nothing after that or after a pull. Expired orders stay in the book until
+    /// someone cancels them or a taker meets them, but the engine does not match them.
+    fn report_resting(&self) {
+        let live = (now_ms() as u64) < self.s.expires_at_ms;
+        let levels: &[Quoted] = if live { &self.s.posted } else { &[] };
+        let bids = levels.iter().filter(|l| l.is_bid).count();
+        let asks = levels.len() - bids;
+        let m = &self.p.metrics;
+        m.quotes.with_label_values(&["bid"]).set(bids as f64);
+        m.quotes.with_label_values(&["ask"]).set(asks as f64);
+        m.quoting.set(!levels.is_empty() as i64);
+        let ladder: Vec<LevelStatus> = levels
+            .iter()
+            .map(|l| LevelStatus {
+                side: if l.is_bid { "bid" } else { "ask" },
+                price: units(l.price),
+                size: units(l.size),
+                reduce_only: l.reduce_only,
+            })
+            .collect();
+        let unanswered = self.s.pending.len();
+        self.p.board.update(|s| {
+            s.quoting = !ladder.is_empty();
+            s.resting_orders = ladder.len();
+            s.ladder = ladder;
+            s.unanswered = unanswered;
+        });
     }
 
     /// The updates to relay: the base feed's always, the collateral's when stale.
@@ -592,7 +913,7 @@ impl Maker {
         m.half_spread_bps
             .set(quote.half_spread_bps.to_f64().unwrap_or(0.0));
         m.skew_bps.set(quote.skew_bps.to_f64().unwrap_or(0.0));
-        m.sigma_bps.set(self.s.sigma_bps.to_f64().unwrap_or(0.0));
+        m.sigma_bps.set(self.s.sigma.bps().to_f64().unwrap_or(0.0));
         m.position.set(position.base.to_f64().unwrap_or(0.0));
         m.health.set(
             health
@@ -600,22 +921,7 @@ impl Maker {
                 .and_then(|h| h.to_f64())
                 .unwrap_or(f64::INFINITY),
         );
-        let bids = quote.levels.iter().filter(|l| l.is_bid).count();
-        let asks = quote.levels.len() - bids;
-        m.quotes.with_label_values(&["bid"]).set(bids as f64);
-        m.quotes.with_label_values(&["ask"]).set(asks as f64);
-        let ladder: Vec<LevelStatus> = quote
-            .levels
-            .iter()
-            .map(|l| LevelStatus {
-                side: if l.is_bid { "bid" } else { "ask" },
-                price: units(l.price),
-                size: units(l.size),
-                reduce_only: l.reduce_only,
-            })
-            .collect();
-        let resting = self.s.resting.len();
-        let sigma = self.s.sigma_bps.with_scale(2).to_string();
+        let sigma = self.s.sigma.bps().with_scale(2).to_string();
         self.p.board.update(|s| {
             s.reference = Some(quote.reference.with_scale(2).to_string());
             s.mid = Some(quote.mid.with_scale(2).to_string());
@@ -625,8 +931,6 @@ impl Maker {
             s.inventory = Some(quote.inventory.label());
             s.position = Some(position.base.with_scale(6).to_string());
             s.health = health.as_ref().map(|h| h.with_scale(2).to_string());
-            s.ladder = ladder;
-            s.resting_orders = resting;
         });
         if quote.inventory != Inventory::Balanced {
             let key = "inventory";

@@ -198,8 +198,12 @@ widens with the price's recent motion and confidence interval, every level expir
 after it is posted. A round (cancel what rests, post the new ladder, close the session through
 the fee extension) is one transaction, sent when the reference moved, a fill landed, the ladder
 changed shape or the expiry needs renewing. Past the inventory limit only the reducing side
-rests; past the hard limit the excess is sold through the book. A stale or uncertain price, a
-paused market or repeated failures pull every quote; so does stopping.
+rests; past the hard limit the excess is sold through the book. A level that would match a
+resting order is left out of its round. A stale or uncertain price, a paused market or a round
+that fails pull every quote, and so does stopping. A failed round is tried again every
+`--min-interval-secs`, and is a critical alert once none has gone through for
+`--failing-alert-after-secs`. A transaction that got no answer is looked up until the full node
+tells what became of it, and the orders it posted are taken over.
 
 ```bash
 target/release/perp-maker \

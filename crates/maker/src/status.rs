@@ -35,6 +35,8 @@ pub struct RoundRecord {
     pub outcome: String,
     pub digest: Option<String>,
     pub levels: usize,
+    /// Levels the quote had and the round left out, because they would have matched.
+    pub left_out: usize,
     pub gas: i64,
 }
 
@@ -54,9 +56,15 @@ pub struct Status {
     pub inventory: Option<&'static str>,
     pub position: Option<String>,
     pub health: Option<String>,
+    /// Whether quotes of the maker rest that the engine still matches.
     pub quoting: bool,
     pub resting_orders: usize,
+    /// The levels that rest, as the last round posted them.
     pub ladder: Vec<LevelStatus>,
+    /// Failures in a row since the last round that went through.
+    pub failures: u32,
+    /// Transactions sent without an answer that the full node is still asked for.
+    pub unanswered: usize,
     pub recent_rounds: VecDeque<RoundRecord>,
     pub flow: Option<FlowStatus>,
     pub problems: BTreeMap<String, Problem>,
@@ -80,7 +88,9 @@ pub struct Problem {
 pub struct Board {
     status: Mutex<Status>,
     last_round: Mutex<Option<Instant>>,
-    /// `/health` fails when no round has completed for this long while quoting.
+    last_poll: Mutex<Option<Instant>>,
+    /// `/health` fails when no round has completed for this long while quoting, or when the
+    /// loop has not finished a poll for this long.
     stale_after: Duration,
 }
 
@@ -89,6 +99,7 @@ impl Board {
         Self {
             status: Mutex::new(status),
             last_round: Mutex::new(None),
+            last_poll: Mutex::new(None),
             stale_after,
         }
     }
@@ -99,6 +110,11 @@ impl Board {
 
     pub fn snapshot(&self) -> Status {
         self.status.lock().unwrap().clone()
+    }
+
+    /// The loop finished a poll. A poll that waits on the full node without end finishes none.
+    pub fn poll_done(&self) {
+        *self.last_poll.lock().unwrap() = Some(Instant::now());
     }
 
     pub fn round_done(&self, record: RoundRecord) {
@@ -126,9 +142,14 @@ impl Board {
         self.status.lock().unwrap().problems.remove(key).is_some()
     }
 
-    /// Healthy while rounds complete and no critical problem is open.
+    /// Healthy while the loop turns, rounds complete and no critical problem is open.
     pub fn health(&self) -> (bool, Vec<String>) {
         let mut reasons = Vec::new();
+        if let Some(at) = *self.last_poll.lock().unwrap()
+            && at.elapsed() > self.stale_after
+        {
+            reasons.push(format!("no poll finished for {} s", at.elapsed().as_secs()));
+        }
         let quoting = self.status.lock().unwrap().quoting;
         match *self.last_round.lock().unwrap() {
             None => reasons.push("no round has completed yet".to_owned()),
@@ -212,5 +233,22 @@ mod tests {
         assert!(board.clear_problem("gas"));
         assert!(board.health().0);
         assert_eq!(board.snapshot().rounds, 1);
+    }
+
+    #[test]
+    fn health_needs_the_loop_to_turn_whether_or_not_quotes_rest() {
+        let board = Board::new(Status::default(), Duration::from_millis(20));
+        board.round_done(RoundRecord::default());
+        board.poll_done();
+        assert!(board.health().0);
+        std::thread::sleep(Duration::from_millis(40));
+        let (healthy, reasons) = board.health();
+        assert!(!healthy);
+        assert!(
+            reasons[0].starts_with("no poll finished for"),
+            "{reasons:?}"
+        );
+        board.poll_done();
+        assert!(board.health().0);
     }
 }

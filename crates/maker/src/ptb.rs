@@ -4,7 +4,8 @@
 //! The maker's transactions. A round is one atomic session of the maker's account: relay the
 //! prices, cancel what rests, open the session, post the ladder (post-only, with an expiry),
 //! close the session through the fee extension when the deployment has one. Either the whole
-//! new book lands or nothing changes.
+//! new book lands or nothing changes. The builder keeps the command of each level's order, so
+//! that a round the engine refuses for one level can be built again without it.
 //!
 //! Object inputs are given by ID only; the full node fills in versions and mutability when it
 //! resolves the transaction.
@@ -70,6 +71,8 @@ pub struct Builder<'a> {
     tx: TransactionBuilder,
     /// `module::function` of every call so far, in order: what an abort's command index names.
     calls: Vec<String>,
+    /// The command index of the order of each level of the round, in the order of the levels.
+    placed: Vec<u64>,
 }
 
 impl<'a> Builder<'a> {
@@ -79,6 +82,7 @@ impl<'a> Builder<'a> {
             object,
             tx: TransactionBuilder::new(),
             calls: Vec::new(),
+            placed: Vec::new(),
         }
     }
 
@@ -94,6 +98,12 @@ impl<'a> Builder<'a> {
             .map(|(i, c)| format!("{i}:{c}"))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The command index of each level's order, in the order of the round's levels. Every
+    /// command of these transactions is a call, so the index of a call is its command's.
+    pub fn placed(&self) -> &[u64] {
+        &self.placed
     }
 
     fn obj(&mut self, id: Address) -> Argument {
@@ -310,6 +320,7 @@ impl<'a> Builder<'a> {
             );
         }
         for (i, level) in round.levels.iter().enumerate() {
+            self.placed.push(self.calls.len() as u64);
             self.limit_order(
                 session,
                 level.is_bid,
@@ -592,6 +603,70 @@ mod tests {
         ] {
             assert!(pure.contains(&wanted), "missing input {wanted:?}");
         }
+    }
+
+    #[test]
+    fn the_builder_names_the_command_of_each_level() {
+        let engine = engine(true);
+        let relay = Relay {
+            package: Address::from_static("0x0a"),
+            source: Address::from_static("0x0b"),
+            config: Address::from_static("0x0c"),
+        };
+        let update = SignedUpdate {
+            price_feed_storage: Address::from_static("0xfa"),
+            storage_id: 0,
+            price: 85_000,
+            confidence: 1,
+            timestamp_ms: 1,
+            public_key: vec![1; 32],
+            signature: vec![2; 64],
+        };
+        let level = |is_bid, price| Level {
+            is_bid,
+            price,
+            size: 10_000_000,
+            reduce_only: false,
+        };
+        let round = Round {
+            cancel: vec![7],
+            levels: vec![
+                level(true, 84_932_000_000_000),
+                level(false, 85_068_000_000_000),
+                level(true, 84_881_000_000_000),
+            ],
+            flatten: Some(Flatten {
+                is_bid: false,
+                price: 84_830_000_000_000,
+                size: 350_000_000,
+            }),
+            expires_at_ms: 1,
+            client_id_base: 0,
+        };
+        let mut b = Builder::new(&engine, &offline);
+        b.refresh(Some((&relay, std::slice::from_ref(&update))))
+            .round(&market(), &round);
+        // The relay, the cancel, `option::none`, the session and the flatten order come first.
+        assert_eq!(b.placed(), [5, 6, 7]);
+        let placed = b.placed().to_vec();
+        let (calls, _) = calls(b.finish());
+        assert_eq!(calls.len(), 10);
+        for command in placed {
+            assert!(calls[command as usize].starts_with("clearing_house::place_limit_order<"));
+        }
+        assert!(calls[4].starts_with("clearing_house::place_limit_order<"));
+        assert!(calls[8].starts_with("fees::end_session<"));
+
+        // Without a level nothing is named, and a pull names nothing.
+        let mut b = Builder::new(&engine, &offline);
+        b.round(
+            &market(),
+            &Round {
+                cancel: vec![1],
+                ..Round::default()
+            },
+        );
+        assert!(b.placed().is_empty());
     }
 
     #[test]

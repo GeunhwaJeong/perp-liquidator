@@ -5,6 +5,7 @@
 //! `docs/perp-maker-design.md` is the design.
 
 pub mod config;
+pub mod failures;
 pub mod flow;
 pub mod maker;
 pub mod market;

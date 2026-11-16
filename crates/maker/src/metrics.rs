@@ -13,6 +13,8 @@ pub struct Metrics {
     pub rounds: IntCounterVec,
     /// Why rounds were sent: moved, refresh, fills, shape, pull, flatten.
     pub reasons: IntCounterVec,
+    /// Levels left out of a round because they would have matched a resting order.
+    pub left_out: IntCounter,
     pub quotes: GaugeVec,
     pub half_spread_bps: Gauge,
     pub skew_bps: Gauge,
@@ -57,6 +59,13 @@ impl Metrics {
                     &["reason"]
                 )
             ),
+            left_out: register!(
+                registry,
+                IntCounter::with_opts(opts(
+                    "levels_left_out_total",
+                    "Levels left out of a round because they would have matched a resting order"
+                ))
+            ),
             quotes: register!(
                 registry,
                 GaugeVec::new(opts("quotes", "Levels resting, by side"), &["side"])
@@ -100,7 +109,7 @@ impl Metrics {
                 registry,
                 IntCounter::with_opts(opts(
                     "fills_total",
-                    "Rounds that found the position changed"
+                    "Polls that found the position changed since the poll before"
                 ))
             ),
             gas_spent: register!(

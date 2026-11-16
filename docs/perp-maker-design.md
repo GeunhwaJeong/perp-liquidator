@@ -33,8 +33,10 @@ price service, alerts, the deployment file).
   that if the process dies the book is empty within a minute instead of resting on a stale
   price forever. The engine cancels expired makers as takers meet them.
 - **Post-only exists** (order type 2) and aborts the whole session when a level would cross.
-  The simulation that precedes every send reports that, and the round is rebuilt with that
-  level moved out one tick; a second failure skips the level.
+  The simulation that precedes every send reports that with the command that aborted, and the
+  round is built again without that level, so that the cancels and the rest of the ladder
+  land. An order someone rests inside the spread costs the maker the levels it would match
+  and nothing else.
 
 ## 2. The quoting model
 
@@ -71,6 +73,8 @@ s = max(s_min, s_base + k_vol × σ_3s + k_conf × confidence_bps)
   fee it is charged (fee tiers may turn that into a rebate later).
 - `σ_3s` is the EWMA of absolute log returns of the signed price between rounds, in bps: what
   one oracle round can move. `k_vol` default 2: the spread covers two rounds of typical motion.
+  It takes one sample per signed price. The maker looks more often than the service signs,
+  and a sample per look would count the looks between two prices as no motion.
 - `confidence_bps` is the signed update's own confidence interval (the venues' disagreement).
 - `s_min` default 5 bp keeps the ladder honest when everything is calm.
 
@@ -138,14 +142,22 @@ Simulated first; signed only when the simulation succeeds; the result waited for
 checkpoint. The order IDs come back in the simulation's return values and the execution's
 `PostedOrder` events.
 
+A transaction that was sent and got no answer may have run. The IDs known to rest are kept (a
+cancel skips the ones that are gone), the full node is asked for the transaction at every poll,
+and the orders it posted are taken over once the node has it. After `--expire-secs` without a
+trace nothing it posted can be matched, and it is forgotten.
+
 ### Kill switches
 
 - Oracle update older than `--max-price-age-secs` (default 8, under the market's 10 s
   tolerance): cancel everything, quote nothing, alert. Resume when fresh.
 - Confidence wider than `--max-confidence-bps` (default 50): as above.
 - Market paused or closed: quote nothing.
-- `--max-failures` PTB failures in a row (default 3): stop, alert critical, try again every
-  `--retry-secs`.
+- A round that fails: cancel what rests in a transaction of its own (a cancel needs no
+  session and no fresh price), and try the round again every `--min-interval-secs`. A try the
+  simulation refuses costs no gas. Once no round has gone through for
+  `--failing-alert-after-secs` (default 30): alert critical, fail `/health`, keep trying.
+  A poll that cannot read the market or the position counts as a failed round.
 - Gas balance under `--min-gas-balance`: alert; under a tenth of it: stop.
 - Shutdown (SIGTERM, ctrl-c): one last round that only cancels.
 
@@ -193,11 +205,12 @@ ratio with the configured limits; the flow key, if on, is a different key with i
 
 ## 6. Observability
 
-`/health` (503 while enabled and no round landed for 2 × `--refresh-secs`, or a kill switch is
-on), `/status` (reference, mid, spread, the ladder as posted, inventory, margin health, last 50
-rounds with digests and outcomes, open kill switches), `/metrics` (`perp_maker_` prefix:
-quotes per side, half-spread bps, inventory, margin health, fills since start, rounds and
-failures, gas, price age). Alerts through the common webhook: started, kill switch on/off,
+`/health` (503 while quotes rest and no round landed for 2 × `--refresh-secs` + 30 s, while the
+loop has not finished a poll for as long, or while a critical problem is open), `/status`
+(reference, mid, spread, the ladder that rests and that the engine still matches, inventory,
+margin health, failures in a row, last 50 rounds with digests and outcomes, open kill
+switches), `/metrics` (`perp_maker_` prefix: quotes per side, half-spread bps, inventory, margin
+health, fills since start, rounds and failures, levels left out, gas, price age). Alerts through the common webhook: started, kill switch on/off,
 inventory limit reached, failures, low gas.
 
 ## 7. Parameters (shadow run defaults)
@@ -220,6 +233,7 @@ inventory limit reached, failures, low gas.
 | `--expire-secs` | 60 | quote expiry |
 | `--min-interval-secs` | 3 | rate limit |
 | `--max-price-age-secs` | 8 | kill switch |
+| `--failing-alert-after-secs` | 30 | failing rounds become a critical problem |
 | `--leverage` | market max (10) | position initial margin ratio = 1 / leverage |
 | `--min-health` | 3.0 | stop growing below |
 

@@ -7,7 +7,7 @@
 //! Prices are USD; the engine takes them in 9-decimal units on the tick, sizes in 9-decimal
 //! base units on the lot.
 
-use bigdecimal::{BigDecimal, One, Signed, ToPrimitive, Zero};
+use bigdecimal::{BigDecimal, One, RoundingMode, Signed, ToPrimitive, Zero};
 
 /// Nine decimals: the engine's price and size units.
 pub const UNIT: u64 = 1_000_000_000;
@@ -275,6 +275,40 @@ pub fn update_sigma(
     (BigDecimal::one() - alpha) * sigma_bps + alpha * move_bps
 }
 
+/// Decimal places the estimate keeps, of a basis point. Every update multiplies it by
+/// `1 - alpha`, which adds a digit that would otherwise stay for as long as the maker runs.
+const SIGMA_SCALE: i64 = 12;
+
+/// The estimate of what one signed price moves, fed once per signed price.
+///
+/// The price service signs every few seconds and the maker looks every second. A sample per
+/// look takes most of its samples between two looks at the same price, as no motion, and the
+/// estimate comes out a fraction of what a signed price moves.
+#[derive(Clone, Debug, Default)]
+pub struct Sigma {
+    bps: BigDecimal,
+    reference: BigDecimal,
+    timestamp_ms: u64,
+}
+
+impl Sigma {
+    pub fn bps(&self) -> &BigDecimal {
+        &self.bps
+    }
+
+    /// Takes the signed price of `timestamp_ms`. A price already taken changes nothing, and
+    /// neither does an older one.
+    pub fn observe(&mut self, reference: &BigDecimal, timestamp_ms: u64, alpha: &BigDecimal) {
+        if timestamp_ms <= self.timestamp_ms {
+            return;
+        }
+        self.bps = update_sigma(&self.bps, &self.reference, reference, alpha)
+            .with_scale_round(SIGMA_SCALE, RoundingMode::HalfEven);
+        self.reference = reference.clone();
+        self.timestamp_ms = timestamp_ms;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -457,5 +491,61 @@ mod tests {
         let sigma = update_sigma(&dec("2"), &dec("85000"), &dec("85085"), &dec("0.1"));
         // 0.9 × 2 + 0.1 × 10 = 2.8.
         assert_eq!(sigma.with_scale(6), dec("2.8").with_scale(6));
+    }
+
+    #[test]
+    fn the_estimate_takes_each_signed_price_once() {
+        let alpha = dec("0.1");
+        // One signed price every three looks, each 10 bp above the one before.
+        let mut per_price = Sigma::default();
+        let mut per_look = BigDecimal::zero();
+        let mut last_look = BigDecimal::zero();
+        let mut price = dec("100000");
+        for round in 1..=30u64 {
+            for _ in 0..3 {
+                per_price.observe(&price, round * 3_000, &alpha);
+                per_look = update_sigma(&per_look, &last_look, &price, &alpha);
+                last_look = price.clone();
+            }
+            price = (&price * dec("1.001")).with_scale(2);
+        }
+        // Twenty-nine moves of about 10 bp: 10 × (1 − 0.9^29) = 9.5.
+        let estimate = per_price.bps().to_f64().unwrap();
+        assert!(estimate > 9.4 && estimate < 9.6, "{estimate}");
+        // A sample per look counts every move once and two looks of no motion with it.
+        let diluted = per_look.to_f64().unwrap();
+        assert!(diluted < estimate / 2.5, "{diluted}");
+    }
+
+    #[test]
+    fn an_older_signed_price_changes_nothing() {
+        let alpha = dec("0.1");
+        let mut sigma = Sigma::default();
+        sigma.observe(&dec("100000"), 3_000, &alpha);
+        sigma.observe(&dec("100100"), 6_000, &alpha);
+        let before = sigma.bps().clone();
+        sigma.observe(&dec("90000"), 6_000, &alpha);
+        sigma.observe(&dec("90000"), 3_000, &alpha);
+        assert_eq!(sigma.bps(), &before);
+        assert_eq!(before, dec("1"));
+    }
+
+    #[test]
+    fn the_estimate_keeps_its_size_however_long_it_runs() {
+        let alpha = dec("0.1");
+        let mut sigma = Sigma::default();
+        let mut unrounded = BigDecimal::zero();
+        let mut last = BigDecimal::zero();
+        for i in 1..=2_000u64 {
+            let price = BigDecimal::from(100_000 + (i % 7) as i64);
+            sigma.observe(&price, i * 3_000, &alpha);
+            unrounded = update_sigma(&unrounded, &last, &price, &alpha);
+            last = price;
+        }
+        assert!(sigma.bps().fractional_digit_count() <= SIGMA_SCALE);
+        // Left alone, the number gains a digit with every update.
+        assert!(unrounded.fractional_digit_count() >= 2_000);
+        let difference = (sigma.bps() - &unrounded).abs();
+        assert!(difference < dec("0.000000001"), "{difference}");
     }
 }
